@@ -26,6 +26,7 @@ pub enum MessageType {
     Binary = 0x02,
     File = 0x03,
     Image = 0x04,
+    Relay = 0x05,
     Auth = 0x10,
     AuthOk = 0x11,
     AuthFail = 0x12,
@@ -40,6 +41,7 @@ impl TryFrom<u8> for MessageType {
             0x02 => Ok(Self::Binary),
             0x03 => Ok(Self::File),
             0x04 => Ok(Self::Image),
+            0x05 => Ok(Self::Relay),
             0x10 => Ok(Self::Auth),
             0x11 => Ok(Self::AuthOk),
             0x12 => Ok(Self::AuthFail),
@@ -205,6 +207,44 @@ pub fn decode_file_payload(payload: &[u8]) -> Result<(String, Vec<u8>), Protocol
         });
     }
     Ok((filename, data))
+}
+
+/// Encode a relay payload for peer-to-peer messaging via the Controller.
+pub fn encode_relay_payload(
+    source_fp: &str,
+    dest_fp: &str,
+    inner_msg_type: MessageType,
+    inner_payload: &[u8],
+) -> Vec<u8> {
+    let src = source_fp.as_bytes();
+    let dst = dest_fp.as_bytes();
+    let mut buf = Vec::with_capacity(2 + src.len() + 2 + dst.len() + 1 + inner_payload.len());
+    buf.extend_from_slice(&(src.len() as u16).to_be_bytes());
+    buf.extend_from_slice(src);
+    buf.extend_from_slice(&(dst.len() as u16).to_be_bytes());
+    buf.extend_from_slice(dst);
+    buf.push(inner_msg_type as u8);
+    buf.extend_from_slice(inner_payload);
+    buf
+}
+
+/// Decode a relay payload. Returns (source_fp, dest_fp, inner_msg_type, inner_payload).
+pub fn decode_relay_payload(
+    payload: &[u8],
+) -> Result<(String, String, MessageType, Vec<u8>), ProtocolError> {
+    let mut offset = 0;
+    let src_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let source_fp = String::from_utf8_lossy(&payload[offset..offset + src_len]).to_string();
+    offset += src_len;
+    let dst_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let dest_fp = String::from_utf8_lossy(&payload[offset..offset + dst_len]).to_string();
+    offset += dst_len;
+    let inner_msg_type = MessageType::try_from(payload[offset])?;
+    offset += 1;
+    let inner_payload = payload[offset..].to_vec();
+    Ok((source_fp, dest_fp, inner_msg_type, inner_payload))
 }
 
 #[cfg(test)]

@@ -1,22 +1,31 @@
 //! SubController (client) — connects to a Controller over WSS.
+//! Supports peer-to-peer relay via Controller and automatic peer discovery.
 
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Received message (from controller).
+/// Received message (from controller or relayed from another peer).
 #[derive(Debug, Clone)]
 pub enum WireMessage {
     Json { data: Value },
     Binary { data: Vec<u8> },
     File { filename: String, data: Vec<u8> },
     Image { filename: String, data: Vec<u8> },
+    /// A message relayed from another SubController.
+    RelayJson { source_fp: String, data: Value },
+    RelayBinary { source_fp: String, data: Vec<u8> },
+    RelayFile { source_fp: String, filename: String, data: Vec<u8> },
+    RelayImage { source_fp: String, filename: String, data: Vec<u8> },
+    /// Peer discovery events.
+    PeerJoined { peer_fp: String },
+    PeerLeft { peer_fp: String },
 }
 
 pub struct SubController {
@@ -29,6 +38,7 @@ pub struct SubController {
     pub message_rx: Option<mpsc::UnboundedReceiver<WireMessage>>,
     message_tx: mpsc::UnboundedSender<WireMessage>,
     listen_handle: Option<tokio::task::JoinHandle<()>>,
+    known_peers: Arc<RwLock<HashSet<String>>>,
 }
 
 impl SubController {
@@ -44,6 +54,7 @@ impl SubController {
             message_rx: Some(message_rx),
             message_tx,
             listen_handle: None,
+            known_peers: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -57,6 +68,10 @@ impl SubController {
 
     pub async fn controller_fingerprint(&self) -> Option<String> {
         self.controller_fingerprint.read().await.clone()
+    }
+
+    pub async fn known_peers(&self) -> Vec<String> {
+        self.known_peers.read().await.iter().cloned().collect()
     }
 
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -168,6 +183,7 @@ impl SubController {
 
         // Spawn reader
         let msg_tx = self.message_tx.clone();
+        let known_peers = self.known_peers.clone();
         let listen_handle = tokio::spawn(async move {
             let stream_buffers: HashMap<[u8; 16], Vec<Vec<u8>>> = HashMap::new();
             let stream_meta: HashMap<[u8; 16], MessageType> = HashMap::new();
@@ -220,13 +236,24 @@ impl SubController {
                         if let Some(chunks) = b.remove(&header.msg_id) {
                             let full: Vec<u8> = chunks.into_iter().flatten().collect();
                             let mt = m.remove(&header.msg_id).unwrap_or(header.msg_type);
-                            dispatch_sub_message(mt, &full, &msg_tx);
+
+                            if mt == MessageType::Relay {
+                                dispatch_relay(&full, &msg_tx);
+                            } else {
+                                dispatch_sub_message(mt, &full, &msg_tx, &known_peers).await;
+                            }
                         }
                     }
                     continue;
                 }
 
-                dispatch_sub_message(header.msg_type, &payload, &msg_tx);
+                // Non-streamed relay
+                if header.msg_type == MessageType::Relay {
+                    dispatch_relay(&payload, &msg_tx);
+                    continue;
+                }
+
+                dispatch_sub_message(header.msg_type, &payload, &msg_tx, &known_peers).await;
             }
             write_handle.abort();
         });
@@ -273,23 +300,83 @@ impl SubController {
             MessageType::File
         };
         let file_payload = encode_file_payload(filename, data);
+        self.send_payload_streamed(msg_type, &file_payload).await
+    }
 
+    // -- peer-to-peer via relay -----------------------------------------------
+
+    pub async fn send_json_to_peer(
+        &self,
+        dest_fp: &str,
+        data: &Value,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let inner = serde_json::to_vec(data)?;
+        let fp = self.fingerprint().ok_or("No fingerprint")?;
+        let relay = encode_relay_payload(&fp, dest_fp, MessageType::Json, &inner);
+        self.send_payload_streamed(MessageType::Relay, &relay).await
+    }
+
+    pub async fn send_binary_to_peer(
+        &self,
+        dest_fp: &str,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let fp = self.fingerprint().ok_or("No fingerprint")?;
+        let relay = encode_relay_payload(&fp, dest_fp, MessageType::Binary, data);
+        self.send_payload_streamed(MessageType::Relay, &relay).await
+    }
+
+    pub async fn send_file_to_peer(
+        &self,
+        dest_fp: &str,
+        filename: &str,
+        data: &[u8],
+        is_image: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let inner_type = if is_image {
+            MessageType::Image
+        } else {
+            MessageType::File
+        };
+        let inner = encode_file_payload(filename, data);
+        let fp = self.fingerprint().ok_or("No fingerprint")?;
+        let relay = encode_relay_payload(&fp, dest_fp, inner_type, &inner);
+        self.send_payload_streamed(MessageType::Relay, &relay).await
+    }
+
+    // -- internal -------------------------------------------------------------
+
+    async fn send_raw(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let sender = self.sender.read().await;
+        let tx = sender.as_ref().ok_or("Not connected")?;
+        tx.send(data)?;
+        Ok(())
+    }
+
+    async fn send_payload_streamed(
+        &self,
+        msg_type: MessageType,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sender = self.sender.read().await;
         let tx = sender.as_ref().ok_or("Not connected")?;
         let msg_id = *uuid::Uuid::new_v4().as_bytes();
 
-        if file_payload.len() <= STREAM_CHUNK_SIZE {
-            let frame = encode_frame(msg_type, &file_payload, Some(msg_id), Flags::NONE, true)?;
+        if payload.len() <= STREAM_CHUNK_SIZE {
+            let frame = encode_frame(msg_type, payload, Some(msg_id), Flags::NONE, true)?;
             tx.send(frame)?;
             return Ok(());
         }
 
         let mut offset = 0;
         let mut first = true;
-        while offset < file_payload.len() {
-            let end = (offset + STREAM_CHUNK_SIZE).min(file_payload.len());
-            let chunk = &file_payload[offset..end];
-            let is_last = end >= file_payload.len();
+        while offset < payload.len() {
+            let end = (offset + STREAM_CHUNK_SIZE).min(payload.len());
+            let chunk = &payload[offset..end];
+            let is_last = end >= payload.len();
 
             let flags = if first {
                 first = false;
@@ -306,31 +393,94 @@ impl SubController {
         }
         Ok(())
     }
-
-    async fn send_raw(
-        &self,
-        data: Vec<u8>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sender = self.sender.read().await;
-        let tx = sender.as_ref().ok_or("Not connected")?;
-        tx.send(data)?;
-        Ok(())
-    }
 }
 
-fn dispatch_sub_message(
-    msg_type: MessageType,
+/// Dispatch a relay message to the message channel.
+fn dispatch_relay(
     payload: &[u8],
     msg_tx: &mpsc::UnboundedSender<WireMessage>,
 ) {
-    let wire_msg = match msg_type {
+    let (source_fp, _dest_fp, inner_type, inner_payload) = match decode_relay_payload(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Relay decode error: {}", e);
+            return;
+        }
+    };
+
+    let wire_msg = match inner_type {
         MessageType::Json => {
-            if let Ok(data) = serde_json::from_slice(payload) {
-                WireMessage::Json { data }
+            if let Ok(data) = serde_json::from_slice(&inner_payload) {
+                WireMessage::RelayJson { source_fp, data }
             } else {
                 return;
             }
         }
+        MessageType::Binary => WireMessage::RelayBinary {
+            source_fp,
+            data: inner_payload,
+        },
+        MessageType::File => {
+            if let Ok((filename, data)) = decode_file_payload(&inner_payload) {
+                WireMessage::RelayFile {
+                    source_fp,
+                    filename,
+                    data,
+                }
+            } else {
+                return;
+            }
+        }
+        MessageType::Image => {
+            if let Ok((filename, data)) = decode_file_payload(&inner_payload) {
+                WireMessage::RelayImage {
+                    source_fp,
+                    filename,
+                    data,
+                }
+            } else {
+                return;
+            }
+        }
+        _ => return,
+    };
+    let _ = msg_tx.send(wire_msg);
+}
+
+async fn dispatch_sub_message(
+    msg_type: MessageType,
+    payload: &[u8],
+    msg_tx: &mpsc::UnboundedSender<WireMessage>,
+    known_peers: &Arc<RwLock<HashSet<String>>>,
+) {
+    // Intercept peer events
+    if msg_type == MessageType::Json {
+        if let Ok(data) = serde_json::from_slice::<Value>(payload) {
+            if let Some(event) = data.get("_wire_peer_event").and_then(|v| v.as_str()) {
+                if let Some(peer_fp) = data.get("peer_fp").and_then(|v| v.as_str()) {
+                    let peer_fp = peer_fp.to_string();
+                    match event {
+                        "joined" => {
+                            known_peers.write().await.insert(peer_fp.clone());
+                            let _ = msg_tx.send(WireMessage::PeerJoined { peer_fp });
+                        }
+                        "left" => {
+                            known_peers.write().await.remove(&peer_fp);
+                            let _ = msg_tx.send(WireMessage::PeerLeft { peer_fp });
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            // Regular JSON - pass through
+            let _ = msg_tx.send(WireMessage::Json { data });
+            return;
+        }
+        return;
+    }
+
+    let wire_msg = match msg_type {
         MessageType::Binary => WireMessage::Binary {
             data: payload.to_vec(),
         },

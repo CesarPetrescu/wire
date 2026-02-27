@@ -1,4 +1,5 @@
 //! Controller (server) — listens for SubController connections over WSS.
+//! Supports relay between SubControllers and peer discovery notifications.
 
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
@@ -196,31 +197,26 @@ impl Controller {
     }
 }
 
-async fn send_streamed(
-    senders: &Arc<RwLock<HashMap<String, PeerSender>>>,
-    peer_fp: &str,
+/// Send a payload using streaming chunks if needed.
+fn send_payload_via_tx(
+    tx: &PeerSender,
     msg_type: MessageType,
-    file_payload: &[u8],
+    payload: &[u8],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let senders_read = senders.read().await;
-    let tx = senders_read
-        .get(peer_fp)
-        .ok_or_else(|| format!("No peer: {}...", &peer_fp[..16]))?;
-
     let msg_id = *uuid::Uuid::new_v4().as_bytes();
 
-    if file_payload.len() <= STREAM_CHUNK_SIZE {
-        let frame = encode_frame(msg_type, file_payload, Some(msg_id), Flags::NONE, true)?;
+    if payload.len() <= STREAM_CHUNK_SIZE {
+        let frame = encode_frame(msg_type, payload, Some(msg_id), Flags::NONE, true)?;
         tx.send(frame)?;
         return Ok(());
     }
 
     let mut offset = 0;
     let mut first = true;
-    while offset < file_payload.len() {
-        let end = (offset + STREAM_CHUNK_SIZE).min(file_payload.len());
-        let chunk = &file_payload[offset..end];
-        let is_last = end >= file_payload.len();
+    while offset < payload.len() {
+        let end = (offset + STREAM_CHUNK_SIZE).min(payload.len());
+        let chunk = &payload[offset..end];
+        let is_last = end >= payload.len();
 
         let flags = if first {
             first = false;
@@ -235,6 +231,32 @@ async fn send_streamed(
         tx.send(frame)?;
         offset = end;
     }
+    Ok(())
+}
+
+async fn send_streamed(
+    senders: &Arc<RwLock<HashMap<String, PeerSender>>>,
+    peer_fp: &str,
+    msg_type: MessageType,
+    file_payload: &[u8],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let senders_read = senders.read().await;
+    let tx = senders_read
+        .get(peer_fp)
+        .ok_or_else(|| format!("No peer: {}...", &peer_fp[..16]))?;
+    send_payload_via_tx(tx, msg_type, file_payload)
+}
+
+/// Send a peer event notification (JSON) to a single peer.
+fn send_peer_event(
+    tx: &PeerSender,
+    event: &str,
+    peer_fp: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let data = serde_json::json!({"_wire_peer_event": event, "peer_fp": peer_fp});
+    let payload = serde_json::to_vec(&data)?;
+    let frame = encode_frame(MessageType::Json, &payload, None, Flags::NONE, true)?;
+    tx.send(frame)?;
     Ok(())
 }
 
@@ -313,8 +335,22 @@ async fn handle_connection(
 
     // Set up send channel for this peer
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+    // Peer notifications: tell existing peers about the new peer, and vice versa
     {
-        senders.write().await.insert(peer_fp.clone(), peer_tx);
+        let mut senders_write = senders.write().await;
+
+        // Tell the new peer about all existing peers
+        for existing_fp in senders_write.keys() {
+            let _ = send_peer_event(&peer_tx, "joined", existing_fp);
+        }
+
+        // Tell all existing peers about the new peer
+        for (_, existing_tx) in senders_write.iter() {
+            let _ = send_peer_event(existing_tx, "joined", &peer_fp);
+        }
+
+        senders_write.insert(peer_fp.clone(), peer_tx);
     }
 
     // Stream reassembly state
@@ -380,9 +416,21 @@ async fn handle_connection(
                 if let Some(chunks) = bufs.remove(&header.msg_id) {
                     let full: Vec<u8> = chunks.into_iter().flatten().collect();
                     let mt = meta.remove(&header.msg_id).unwrap_or(header.msg_type);
-                    dispatch_message(&peer_fp, mt, &full, &msg_tx);
+
+                    // Relay messages need special handling
+                    if mt == MessageType::Relay {
+                        handle_relay(&peer_fp, &full, &senders).await;
+                    } else {
+                        dispatch_message(&peer_fp, mt, &full, &msg_tx);
+                    }
                 }
             }
+            continue;
+        }
+
+        // Non-streamed relay
+        if header.msg_type == MessageType::Relay {
+            handle_relay(&peer_fp, &payload, &senders).await;
             continue;
         }
 
@@ -390,9 +438,48 @@ async fn handle_connection(
     }
 
     write_handle.abort();
-    senders_clone.write().await.remove(&peer_fp_clone);
+
+    // Notify remaining peers that this peer has left
+    {
+        let mut senders_write = senders_clone.write().await;
+        senders_write.remove(&peer_fp_clone);
+        for (_, tx) in senders_write.iter() {
+            let _ = send_peer_event(tx, "left", &peer_fp_clone);
+        }
+    }
+
     info!("Peer disconnected: {}...", &peer_fp_clone[..16.min(peer_fp_clone.len())]);
     Ok(())
+}
+
+/// Handle a relay message: decode, find destination, re-wrap with actual sender, forward.
+async fn handle_relay(
+    sender_fp: &str,
+    payload: &[u8],
+    senders: &Arc<RwLock<HashMap<String, PeerSender>>>,
+) {
+    let (_source_fp, dest_fp, inner_type, inner_payload) = match decode_relay_payload(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("Relay decode error: {}", e);
+            return;
+        }
+    };
+
+    let senders_read = senders.read().await;
+    let dest_tx = match senders_read.get(&dest_fp) {
+        Some(tx) => tx,
+        None => {
+            warn!("Relay target not connected: {}...", &dest_fp[..16.min(dest_fp.len())]);
+            return;
+        }
+    };
+
+    // Re-wrap with the actual sender fingerprint (don't trust client-supplied source)
+    let relay_out = encode_relay_payload(sender_fp, &dest_fp, inner_type, &inner_payload);
+    if let Err(e) = send_payload_via_tx(dest_tx, MessageType::Relay, &relay_out) {
+        error!("Relay forward error: {}", e);
+    }
 }
 
 fn dispatch_message(

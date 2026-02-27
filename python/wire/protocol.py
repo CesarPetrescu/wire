@@ -19,6 +19,9 @@ Message types:
   0x03  FILE        - file transfer (first 2 bytes = filename length, then
                       filename UTF-8, then 32-byte SHA-256 checksum, then file bytes)
   0x04  IMAGE       - image data (same sub-header as FILE)
+  0x05  RELAY       - peer-to-peer relay via Controller
+                      (2-byte src_fp len + src_fp + 2-byte dst_fp len + dst_fp
+                       + 1-byte inner msg type + inner payload)
   0x10  AUTH        - authentication handshake
   0x11  AUTH_OK     - auth accepted
   0x12  AUTH_FAIL   - auth rejected
@@ -44,6 +47,7 @@ class MessageType(enum.IntEnum):
     BINARY = 0x02
     FILE = 0x03
     IMAGE = 0x04
+    RELAY = 0x05
     AUTH = 0x10
     AUTH_OK = 0x11
     AUTH_FAIL = 0x12
@@ -149,3 +153,38 @@ def decode_file_payload(payload: bytes) -> tuple[str, bytes]:
             f"expected {expected_checksum.hex()}, got {actual_checksum.hex()}"
         )
     return filename, data
+
+
+def encode_relay_payload(
+    source_fp: str, dest_fp: str, inner_msg_type: MessageType, inner_payload: bytes
+) -> bytes:
+    """Encode a relay payload for peer-to-peer messaging via the Controller."""
+    src = source_fp.encode("utf-8")
+    dst = dest_fp.encode("utf-8")
+    return (
+        struct.pack("!H", len(src))
+        + src
+        + struct.pack("!H", len(dst))
+        + dst
+        + struct.pack("!B", int(inner_msg_type))
+        + inner_payload
+    )
+
+
+def decode_relay_payload(
+    payload: bytes,
+) -> tuple[str, str, MessageType, bytes]:
+    """Decode a relay payload. Returns (source_fp, dest_fp, inner_msg_type, inner_payload)."""
+    offset = 0
+    src_len = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    source_fp = payload[offset : offset + src_len].decode("utf-8")
+    offset += src_len
+    dst_len = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    dest_fp = payload[offset : offset + dst_len].decode("utf-8")
+    offset += dst_len
+    inner_msg_type = MessageType(payload[offset])
+    offset += 1
+    inner_payload = payload[offset:]
+    return source_fp, dest_fp, inner_msg_type, inner_payload

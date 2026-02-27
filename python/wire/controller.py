@@ -6,12 +6,15 @@ Handles:
   - Pre-shared secret authentication on first connect
   - Cert fingerprint pinning after initial auth
   - JSON / Binary / File / Image / Streaming over a single WebSocket
+  - Relay: forwards messages between SubControllers (star topology)
+  - Peer notifications: informs SubControllers of peer join/leave events
 """
 
 import asyncio
 import json
 import logging
 import ssl
+import uuid
 from typing import Any, Callable, Coroutine, Optional
 
 import websockets
@@ -25,8 +28,10 @@ from wire.protocol import (
     MessageType,
     decode_file_payload,
     decode_frame,
+    decode_relay_payload,
     encode_file_payload,
     encode_frame,
+    encode_relay_payload,
 )
 
 logger = logging.getLogger("wire.controller")
@@ -129,7 +134,8 @@ class Controller:
         if not ws:
             raise ValueError(f"No peer with fingerprint {peer_fp[:16]}...")
         msg_type = MessageType.IMAGE if is_image else MessageType.FILE
-        await self._send_streamed(ws, msg_type, filename, data)
+        file_payload = encode_file_payload(filename, data)
+        await self._send_payload_streamed(ws, msg_type, file_payload)
 
     async def broadcast_json(self, data: Any):
         """Send JSON to all connected peers."""
@@ -156,7 +162,11 @@ class Controller:
             self._peers[peer_fp] = ws
             logger.info("Peer authenticated: %s", peer_fp[:16] + "...")
 
-            # Step 2: Message loop
+            # Step 2: Notify existing peers about the new peer, and send
+            # the new peer a list of already-connected peers.
+            await self._notify_peer_joined(peer_fp)
+
+            # Step 3: Message loop
             async for raw in ws:
                 if isinstance(raw, str):
                     raw = raw.encode("utf-8")
@@ -170,6 +180,7 @@ class Controller:
         finally:
             if peer_fp and peer_fp in self._peers:
                 del self._peers[peer_fp]
+                await self._notify_peer_left(peer_fp)
 
     async def _authenticate(self, ws) -> str | None:
         """Perform pre-shared secret + cert fingerprint exchange."""
@@ -228,6 +239,11 @@ class Controller:
             await self._handle_stream_chunk(peer_fp, header, payload)
             return
 
+        # Relay messages — forward to destination peer
+        if header.msg_type == MessageType.RELAY:
+            await self._handle_relay(peer_fp, payload)
+            return
+
         # Non-streamed messages
         handler = self._handlers.get(header.msg_type)
         if handler is None:
@@ -261,6 +277,12 @@ class Controller:
                 self._stream_buffers[mid].append(payload)
                 full = b"".join(self._stream_buffers.pop(mid))
                 msg_type = self._stream_meta.pop(mid)
+
+                # Relay messages need special handling
+                if msg_type == MessageType.RELAY:
+                    await self._handle_relay(peer_fp, full)
+                    return
+
                 handler = self._handlers.get(msg_type)
                 if handler:
                     if msg_type in (MessageType.FILE, MessageType.IMAGE):
@@ -269,27 +291,71 @@ class Controller:
                     else:
                         await handler(peer_fp, full)
 
-    async def _send_streamed(
-        self, ws, msg_type: MessageType, filename: str, data: bytes
+    async def _handle_relay(self, sender_fp: str, payload: bytes):
+        """Decode a relay payload and forward it to the destination peer."""
+        source_fp, dest_fp, inner_type, inner_payload = decode_relay_payload(payload)
+
+        ws = self._peers.get(dest_fp)
+        if ws is None:
+            logger.warning(
+                "Relay target not connected: %s (from %s)",
+                dest_fp[:16], sender_fp[:16],
+            )
+            return
+
+        # Re-wrap with the actual sender fingerprint (don't trust client-supplied source)
+        relay_out = encode_relay_payload(sender_fp, dest_fp, inner_type, inner_payload)
+        await self._send_payload_streamed(ws, MessageType.RELAY, relay_out)
+
+    async def _notify_peer_joined(self, new_fp: str):
+        """Tell all existing peers about the new peer, and tell the new
+        peer about all already-connected peers."""
+        existing_fps = [fp for fp in self._peers if fp != new_fp]
+
+        # Tell the new peer about everyone else
+        if existing_fps:
+            new_ws = self._peers[new_fp]
+            for fp in existing_fps:
+                event = json.dumps({"_wire_peer_event": "joined", "peer_fp": fp}).encode()
+                frame = encode_frame(MessageType.JSON, event, compress=True)
+                await new_ws.send(frame)
+
+        # Tell everyone else about the new peer
+        event = json.dumps({"_wire_peer_event": "joined", "peer_fp": new_fp}).encode()
+        frame = encode_frame(MessageType.JSON, event, compress=True)
+        for fp, ws in self._peers.items():
+            if fp != new_fp:
+                try:
+                    await ws.send(frame)
+                except Exception:
+                    pass
+
+    async def _notify_peer_left(self, gone_fp: str):
+        """Tell all remaining peers that a peer has disconnected."""
+        event = json.dumps({"_wire_peer_event": "left", "peer_fp": gone_fp}).encode()
+        frame = encode_frame(MessageType.JSON, event, compress=True)
+        for ws in self._peers.values():
+            try:
+                await ws.send(frame)
+            except Exception:
+                pass
+
+    async def _send_payload_streamed(
+        self, ws, msg_type: MessageType, payload: bytes
     ):
-        """Send a file in streaming chunks over the WebSocket."""
-        import uuid
-
+        """Send any payload in streaming chunks over the WebSocket."""
         msg_id = uuid.uuid4().bytes
-        file_payload = encode_file_payload(filename, data)
 
-        if len(file_payload) <= STREAM_CHUNK_SIZE:
-            # Small enough for a single frame
-            frame = encode_frame(msg_type, file_payload, msg_id=msg_id, compress=True)
+        if len(payload) <= STREAM_CHUNK_SIZE:
+            frame = encode_frame(msg_type, payload, msg_id=msg_id, compress=True)
             await ws.send(frame)
             return
 
-        # Stream in chunks
         offset = 0
         first = True
-        while offset < len(file_payload):
-            chunk = file_payload[offset : offset + STREAM_CHUNK_SIZE]
-            is_last = (offset + STREAM_CHUNK_SIZE) >= len(file_payload)
+        while offset < len(payload):
+            chunk = payload[offset : offset + STREAM_CHUNK_SIZE]
+            is_last = (offset + STREAM_CHUNK_SIZE) >= len(payload)
 
             if first:
                 flags = Flags.STREAM_START
