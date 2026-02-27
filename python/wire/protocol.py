@@ -17,7 +17,7 @@ Message types:
   0x01  JSON        - payload is UTF-8 JSON
   0x02  BINARY      - arbitrary binary blob
   0x03  FILE        - file transfer (first 2 bytes = filename length, then
-                      filename UTF-8, then file bytes)
+                      filename UTF-8, then 32-byte SHA-256 checksum, then file bytes)
   0x04  IMAGE       - image data (same sub-header as FILE)
   0x10  AUTH        - authentication handshake
   0x11  AUTH_OK     - auth accepted
@@ -26,6 +26,7 @@ Message types:
 """
 
 import enum
+import hashlib
 import struct
 import uuid
 import zlib
@@ -120,15 +121,31 @@ def decode_frame(data: bytes) -> tuple[FrameHeader, bytes]:
     return header, payload
 
 
+CHECKSUM_SIZE = 32  # SHA-256 produces 32 bytes
+
+
+class ChecksumError(Exception):
+    """Raised when a file payload checksum does not match."""
+
+
 def encode_file_payload(filename: str, data: bytes) -> bytes:
-    """Encode a file payload: 2-byte filename length + filename + data."""
+    """Encode a file payload: 2-byte filename length + filename + SHA-256 checksum + data."""
     name_bytes = filename.encode("utf-8")
-    return struct.pack("!H", len(name_bytes)) + name_bytes + data
+    checksum = hashlib.sha256(data).digest()
+    return struct.pack("!H", len(name_bytes)) + name_bytes + checksum + data
 
 
 def decode_file_payload(payload: bytes) -> tuple[str, bytes]:
-    """Decode a file payload back to (filename, data)."""
+    """Decode a file payload back to (filename, data) and verify SHA-256 checksum."""
     name_len = struct.unpack("!H", payload[:2])[0]
     filename = payload[2 : 2 + name_len].decode("utf-8")
-    data = payload[2 + name_len :]
+    checksum_start = 2 + name_len
+    expected_checksum = payload[checksum_start : checksum_start + CHECKSUM_SIZE]
+    data = payload[checksum_start + CHECKSUM_SIZE :]
+    actual_checksum = hashlib.sha256(data).digest()
+    if actual_checksum != expected_checksum:
+        raise ChecksumError(
+            f"File '{filename}' checksum mismatch: "
+            f"expected {expected_checksum.hex()}, got {actual_checksum.hex()}"
+        )
     return filename, data

@@ -8,9 +8,12 @@
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use thiserror::Error;
 use uuid::Uuid;
+
+pub const CHECKSUM_SIZE: usize = 32; // SHA-256 produces 32 bytes
 
 pub const MAGIC: u16 = 0xBE01;
 pub const HEADER_SIZE: usize = 2 + 1 + 16 + 1 + 4; // 24 bytes
@@ -79,6 +82,12 @@ pub enum ProtocolError {
     DecompressError(String),
     #[error("Compression error: {0}")]
     CompressError(String),
+    #[error("Checksum mismatch for file '{filename}': expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        filename: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Encode a single frame with header + payload.
@@ -165,24 +174,36 @@ pub fn decode_frame(data: &[u8]) -> Result<(FrameHeader, Vec<u8>), ProtocolError
     ))
 }
 
-/// Encode a file payload: 2-byte filename length + filename + data.
+/// Encode a file payload: 2-byte filename length + filename + SHA-256 checksum + data.
 pub fn encode_file_payload(filename: &str, data: &[u8]) -> Vec<u8> {
     let name_bytes = filename.as_bytes();
-    let mut buf = Vec::with_capacity(2 + name_bytes.len() + data.len());
+    let checksum = Sha256::digest(data);
+    let mut buf = Vec::with_capacity(2 + name_bytes.len() + CHECKSUM_SIZE + data.len());
     buf.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(name_bytes);
+    buf.extend_from_slice(&checksum);
     buf.extend_from_slice(data);
     buf
 }
 
-/// Decode a file payload back to (filename, data).
+/// Decode a file payload back to (filename, data) and verify SHA-256 checksum.
 pub fn decode_file_payload(payload: &[u8]) -> Result<(String, Vec<u8>), ProtocolError> {
     if payload.len() < 2 {
         return Err(ProtocolError::FrameTooShort(payload.len()));
     }
     let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
     let filename = String::from_utf8_lossy(&payload[2..2 + name_len]).to_string();
-    let data = payload[2 + name_len..].to_vec();
+    let checksum_start = 2 + name_len;
+    let expected_checksum = &payload[checksum_start..checksum_start + CHECKSUM_SIZE];
+    let data = payload[checksum_start + CHECKSUM_SIZE..].to_vec();
+    let actual_checksum = Sha256::digest(&data);
+    if actual_checksum.as_slice() != expected_checksum {
+        return Err(ProtocolError::ChecksumMismatch {
+            filename,
+            expected: hex::encode(expected_checksum),
+            actual: hex::encode(actual_checksum),
+        });
+    }
     Ok((filename, data))
 }
 
@@ -283,5 +304,38 @@ mod tests {
         let (header, payload) = decode_frame(&frame).unwrap();
         assert_eq!(header.msg_type, MessageType::Ping);
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_checksum_embedded_in_payload() {
+        let filename = "test.zip";
+        let data = vec![0x50, 0x4b, 0x03, 0x04, 0x00, 0x00];
+        let encoded = encode_file_payload(filename, &data);
+        let checksum_offset = 2 + filename.len();
+        let embedded = &encoded[checksum_offset..checksum_offset + CHECKSUM_SIZE];
+        let expected = Sha256::digest(&data);
+        assert_eq!(embedded, expected.as_slice());
+    }
+
+    #[test]
+    fn test_checksum_mismatch_raises() {
+        let filename = "corrupted.zip";
+        let data = b"original data content";
+        let mut encoded = encode_file_payload(filename, data);
+        // Corrupt a byte in the file data (last byte)
+        let last = encoded.len() - 1;
+        encoded[last] ^= 0xFF;
+        let result = decode_file_payload(&encoded);
+        assert!(matches!(result, Err(ProtocolError::ChecksumMismatch { .. })));
+    }
+
+    #[test]
+    fn test_checksum_valid_empty_data() {
+        let filename = "empty.bin";
+        let data: &[u8] = b"";
+        let encoded = encode_file_payload(filename, data);
+        let (dec_name, dec_data) = decode_file_payload(&encoded).unwrap();
+        assert_eq!(dec_name, filename);
+        assert!(dec_data.is_empty());
     }
 }
