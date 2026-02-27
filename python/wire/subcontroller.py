@@ -6,6 +6,8 @@ Mirrors the Controller's capabilities on the client side:
   - Authenticates with pre-shared secret
   - Pins the Controller's cert fingerprint
   - Full bidirectional JSON / Binary / File / Image / Stream
+  - Peer-to-peer relay via Controller (star topology)
+  - Automatic peer discovery via Controller notifications
 """
 
 import asyncio
@@ -24,8 +26,10 @@ from wire.protocol import (
     MessageType,
     decode_file_payload,
     decode_frame,
+    decode_relay_payload,
     encode_file_payload,
     encode_frame,
+    encode_relay_payload,
 )
 
 logger = logging.getLogger("wire.subcontroller")
@@ -52,11 +56,15 @@ class SubController:
 
         self._ws: websockets.asyncio.client.ClientConnection | None = None
         self._handlers: dict[MessageType, Handler] = {}
+        self._relay_handlers: dict[MessageType, Handler] = {}
         self._listen_task: asyncio.Task | None = None
 
         # Stream reassembly
         self._stream_buffers: dict[bytes, list[bytes]] = {}
         self._stream_meta: dict[bytes, MessageType] = {}
+
+        # Known peers (other SubControllers connected to the same Controller)
+        self._known_peers: set[str] = set()
 
     # -- public API ----------------------------------------------------------
 
@@ -68,6 +76,21 @@ class SubController:
             return fn
 
         return decorator
+
+    def on_relay(self, msg_type: MessageType):
+        """Decorator to register a handler for relayed peer-to-peer messages.
+        Handler signature: async def handler(source_fp, ...) where ... depends on type."""
+
+        def decorator(fn: Handler):
+            self._relay_handlers[msg_type] = fn
+            return fn
+
+        return decorator
+
+    @property
+    def known_peers(self) -> list[str]:
+        """List of fingerprints of other SubControllers connected to the Controller."""
+        return list(self._known_peers)
 
     async def connect(self):
         """Generate certs, connect to the controller, and authenticate."""
@@ -123,7 +146,39 @@ class SubController:
         """Send a file (or image). Streams in chunks for large files."""
         self._ensure_connected()
         msg_type = MessageType.IMAGE if is_image else MessageType.FILE
-        await self._send_streamed(self._ws, msg_type, filename, data)
+        file_payload = encode_file_payload(filename, data)
+        await self._send_payload_streamed(self._ws, msg_type, file_payload)
+
+    # -- peer-to-peer via relay ----------------------------------------------
+
+    async def send_json_to_peer(self, dest_fp: str, data: Any):
+        """Send a JSON message to another SubController via relay."""
+        self._ensure_connected()
+        inner = json.dumps(data).encode("utf-8")
+        relay = encode_relay_payload(
+            self.cert_bundle.fingerprint, dest_fp, MessageType.JSON, inner
+        )
+        await self._send_payload_streamed(self._ws, MessageType.RELAY, relay)
+
+    async def send_binary_to_peer(self, dest_fp: str, data: bytes):
+        """Send binary data to another SubController via relay."""
+        self._ensure_connected()
+        relay = encode_relay_payload(
+            self.cert_bundle.fingerprint, dest_fp, MessageType.BINARY, data
+        )
+        await self._send_payload_streamed(self._ws, MessageType.RELAY, relay)
+
+    async def send_file_to_peer(
+        self, dest_fp: str, filename: str, data: bytes, is_image: bool = False
+    ):
+        """Send a file to another SubController via relay."""
+        self._ensure_connected()
+        inner_type = MessageType.IMAGE if is_image else MessageType.FILE
+        inner = encode_file_payload(filename, data)
+        relay = encode_relay_payload(
+            self.cert_bundle.fingerprint, dest_fp, inner_type, inner
+        )
+        await self._send_payload_streamed(self._ws, MessageType.RELAY, relay)
 
     # -- internal ------------------------------------------------------------
 
@@ -198,15 +253,28 @@ class SubController:
             await self._handle_stream_chunk(header, payload)
             return
 
+        # Relay messages from another SubController
+        if header.msg_type == MessageType.RELAY:
+            await self._dispatch_relay(payload)
+            return
+
+        # Intercept internal peer events before user handlers
+        if header.msg_type == MessageType.JSON:
+            data = json.loads(payload)
+            if "_wire_peer_event" in data:
+                self._handle_peer_event(data)
+                return
+            handler = self._handlers.get(header.msg_type)
+            if handler:
+                await handler(data)
+            return
+
         handler = self._handlers.get(header.msg_type)
         if handler is None:
             logger.debug("No handler for message type %s", header.msg_type)
             return
 
-        if header.msg_type == MessageType.JSON:
-            data = json.loads(payload)
-            await handler(data)
-        elif header.msg_type in (MessageType.FILE, MessageType.IMAGE):
+        if header.msg_type in (MessageType.FILE, MessageType.IMAGE):
             filename, file_data = decode_file_payload(payload)
             await handler(filename, file_data)
         elif header.msg_type == MessageType.BINARY:
@@ -228,6 +296,12 @@ class SubController:
                 self._stream_buffers[mid].append(payload)
                 full = b"".join(self._stream_buffers.pop(mid))
                 msg_type = self._stream_meta.pop(mid)
+
+                # Relay messages need special handling
+                if msg_type == MessageType.RELAY:
+                    await self._dispatch_relay(full)
+                    return
+
                 handler = self._handlers.get(msg_type)
                 if handler:
                     if msg_type in (MessageType.FILE, MessageType.IMAGE):
@@ -236,21 +310,53 @@ class SubController:
                     else:
                         await handler(full)
 
-    async def _send_streamed(self, ws, msg_type: MessageType, filename: str, data: bytes):
-        """Send a file in streaming chunks."""
-        msg_id = uuid.uuid4().bytes
-        file_payload = encode_file_payload(filename, data)
+    async def _dispatch_relay(self, payload: bytes):
+        """Decode a relay payload and dispatch to the relay handler."""
+        source_fp, dest_fp, inner_type, inner_payload = decode_relay_payload(payload)
 
-        if len(file_payload) <= STREAM_CHUNK_SIZE:
-            frame = encode_frame(msg_type, file_payload, msg_id=msg_id, compress=True)
+        handler = self._relay_handlers.get(inner_type)
+        if handler is None:
+            logger.debug("No relay handler for %s", inner_type)
+            return
+
+        if inner_type in (MessageType.FILE, MessageType.IMAGE):
+            filename, file_data = decode_file_payload(inner_payload)
+            await handler(source_fp, filename, file_data)
+        elif inner_type == MessageType.JSON:
+            data = json.loads(inner_payload)
+            await handler(source_fp, data)
+        elif inner_type == MessageType.BINARY:
+            await handler(source_fp, inner_payload)
+        else:
+            await handler(source_fp, inner_payload)
+
+    def _handle_peer_event(self, data: dict):
+        """Handle internal peer join/leave notifications from the Controller."""
+        event = data["_wire_peer_event"]
+        peer_fp = data["peer_fp"]
+        if event == "joined":
+            self._known_peers.add(peer_fp)
+            logger.info("Peer joined: %s", peer_fp[:16] + "...")
+        elif event == "left":
+            self._known_peers.discard(peer_fp)
+            logger.info("Peer left: %s", peer_fp[:16] + "...")
+
+    async def _send_payload_streamed(
+        self, ws, msg_type: MessageType, payload: bytes
+    ):
+        """Send any payload in streaming chunks."""
+        msg_id = uuid.uuid4().bytes
+
+        if len(payload) <= STREAM_CHUNK_SIZE:
+            frame = encode_frame(msg_type, payload, msg_id=msg_id, compress=True)
             await ws.send(frame)
             return
 
         offset = 0
         first = True
-        while offset < len(file_payload):
-            chunk = file_payload[offset : offset + STREAM_CHUNK_SIZE]
-            is_last = (offset + STREAM_CHUNK_SIZE) >= len(file_payload)
+        while offset < len(payload):
+            chunk = payload[offset : offset + STREAM_CHUNK_SIZE]
+            is_last = (offset + STREAM_CHUNK_SIZE) >= len(payload)
 
             if first:
                 flags = Flags.STREAM_START
