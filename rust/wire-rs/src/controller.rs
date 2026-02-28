@@ -3,6 +3,7 @@
 
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
+use crate::proxy::ReverseProxy;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -48,6 +49,10 @@ pub struct Controller {
     pub message_rx: Option<mpsc::UnboundedReceiver<WireMessage>>,
     message_tx: mpsc::UnboundedSender<WireMessage>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    // Embedded reverse proxy
+    proxy: Option<ReverseProxy>,
+    /// Maps peer fingerprint → list of path prefixes bound to that peer.
+    peer_proxy_routes: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl Controller {
@@ -63,6 +68,8 @@ impl Controller {
             message_rx: Some(message_rx),
             message_tx,
             shutdown_tx: None,
+            proxy: None,
+            peer_proxy_routes: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -99,6 +106,8 @@ impl Controller {
         let pinned = self.pinned_peers.clone();
         let senders = self.peer_senders.clone();
         let msg_tx = self.message_tx.clone();
+        let peer_proxy_routes = self.peer_proxy_routes.clone();
+        let proxy_routes_table = self.proxy.as_ref().map(|p| p.routes_table());
 
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
@@ -114,9 +123,12 @@ impl Controller {
                                 let pinned = pinned.clone();
                                 let senders = senders.clone();
                                 let msg_tx = msg_tx.clone();
+                                let peer_proxy_routes = peer_proxy_routes.clone();
+                                let proxy_routes_table = proxy_routes_table.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_connection(
                                         stream, acceptor, bundle, secret, pinned, senders, msg_tx,
+                                        peer_proxy_routes, proxy_routes_table,
                                     ).await {
                                         error!("Connection error: {}", e);
                                     }
@@ -137,8 +149,81 @@ impl Controller {
     }
 
     pub async fn stop(&mut self) {
+        if let Some(proxy) = self.proxy.as_mut() {
+            proxy.stop().await;
+        }
+        self.proxy = None;
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(true);
+        }
+    }
+
+    // -- embedded reverse proxy -----------------------------------------------
+
+    /// Start an embedded HTTP reverse proxy alongside the WebSocket server.
+    pub async fn enable_proxy(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut proxy = ReverseProxy::new(host, port);
+        proxy.start().await?;
+        self.proxy = Some(proxy);
+        info!("Embedded proxy enabled on http://{}:{}", host, port);
+        Ok(())
+    }
+
+    /// Stop the embedded proxy.
+    pub async fn disable_proxy(&mut self) {
+        if let Some(mut proxy) = self.proxy.take() {
+            proxy.stop().await;
+        }
+        self.peer_proxy_routes.write().await.clear();
+        info!("Embedded proxy disabled.");
+    }
+
+    /// Add a static proxy route (not tied to any peer lifecycle).
+    pub async fn add_proxy_route(&self, path_prefix: &str, upstream_url: &str) {
+        let proxy = self.proxy.as_ref().expect("Proxy not enabled. Call enable_proxy() first.");
+        proxy.add_route(path_prefix, upstream_url).await;
+    }
+
+    /// Remove a proxy route.
+    pub async fn remove_proxy_route(&self, path_prefix: &str) {
+        let proxy = self.proxy.as_ref().expect("Proxy not enabled. Call enable_proxy() first.");
+        proxy.remove_route(path_prefix).await;
+    }
+
+    /// Add a proxy route tied to a connected peer's lifecycle.
+    ///
+    /// When the peer disconnects, the route is automatically removed.
+    pub async fn add_proxy_route_for_peer(
+        &self,
+        path_prefix: &str,
+        peer_fp: &str,
+        upstream_url: &str,
+    ) {
+        let proxy = self.proxy.as_ref().expect("Proxy not enabled. Call enable_proxy() first.");
+        proxy.add_route(path_prefix, upstream_url).await;
+        self.peer_proxy_routes
+            .write()
+            .await
+            .entry(peer_fp.to_string())
+            .or_default()
+            .push(path_prefix.to_string());
+        info!(
+            "Proxy route {} -> {} bound to peer {}...",
+            path_prefix,
+            upstream_url,
+            &peer_fp[..16.min(peer_fp.len())]
+        );
+    }
+
+    /// Return a snapshot of the current proxy routes, or None if proxy is not enabled.
+    pub async fn proxy_routes(&self) -> Option<HashMap<String, String>> {
+        match self.proxy.as_ref() {
+            Some(proxy) => Some(proxy.routes_snapshot().await),
+            None => None,
         }
     }
 
@@ -268,6 +353,8 @@ async fn handle_connection(
     pinned: Arc<RwLock<HashMap<String, bool>>>,
     senders: Arc<RwLock<HashMap<String, PeerSender>>>,
     msg_tx: mpsc::UnboundedSender<WireMessage>,
+    peer_proxy_routes: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    proxy_routes_table: Option<crate::proxy::RouteTable>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_stream = acceptor.accept(stream).await?;
     let ws_stream = tokio_tungstenite::accept_async(tls_stream).await?;
@@ -445,6 +532,27 @@ async fn handle_connection(
         senders_write.remove(&peer_fp_clone);
         for (_, tx) in senders_write.iter() {
             let _ = send_peer_event(tx, "left", &peer_fp_clone);
+        }
+    }
+
+    // Clean up proxy routes bound to this peer
+    if let Some(ref proxy_table) = proxy_routes_table {
+        let mut ppr = peer_proxy_routes.write().await;
+        if let Some(prefixes) = ppr.remove(&peer_fp_clone) {
+            let mut routes = proxy_table.write().await;
+            for prefix in &prefixes {
+                let normalised = if prefix == "/" {
+                    "/".to_string()
+                } else {
+                    format!("/{}", prefix.trim_matches('/'))
+                };
+                routes.remove(&normalised);
+                info!(
+                    "Auto-removed proxy route {} (peer {}... left)",
+                    normalised,
+                    &peer_fp_clone[..16.min(peer_fp_clone.len())]
+                );
+            }
         }
     }
 

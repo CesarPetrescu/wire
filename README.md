@@ -322,6 +322,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 ```
 
+### Integrated proxy on Controller / SubController
+
+The reverse proxy can be **embedded directly** into a Controller or
+SubController.  This is the recommended way to expose connected peers' HTTP
+services through a single gateway.
+
+**Key concept — peer-bound routes:**
+`add_proxy_route_for_peer(path, peer_fp, upstream_url)` ties a route to a
+connected SubController.  When that SubController disconnects, the route is
+**automatically removed**.
+
+```text
+Browser / curl
+    |
+    v
+Controller  (WSS :8765  +  HTTP proxy :8080)
+    |            |            |
+    v            v            v
+SubCtrl-A    SubCtrl-B    SubCtrl-C
+(API :3001)  (API :3002)  (Dashboard :3003)
+```
+
+#### Python — Controller with proxy
+
+```python
+ctrl = Controller(host="0.0.0.0", port=8765, preshared_secret="s3cret")
+await ctrl.start()
+await ctrl.enable_proxy(host="0.0.0.0", port=8080)
+
+# Static route (always active)
+ctrl.add_proxy_route("/status", "http://monitoring:9090")
+
+# Peer-bound route — auto-removed when the SubController disconnects
+ctrl.add_proxy_route_for_peer("/worker-a/api", worker_a_fp, "http://10.0.0.5:3001")
+
+# GET http://controller:8080/worker-a/api/health
+#   → forwarded to http://10.0.0.5:3001/health
+```
+
+#### Rust — Controller with proxy
+
+```rust
+let mut ctrl = Controller::new("0.0.0.0", 8765, "s3cret");
+ctrl.start().await?;
+ctrl.enable_proxy("0.0.0.0", 8080).await?;
+
+ctrl.add_proxy_route("/status", "http://monitoring:9090").await;
+ctrl.add_proxy_route_for_peer("/worker-a/api", &worker_a_fp, "http://10.0.0.5:3001").await;
+```
+
+#### Python — SubController with its own proxy
+
+```python
+sub = SubController(controller_url="wss://controller:8765", preshared_secret="s3cret")
+await sub.connect()
+await sub.enable_proxy(host="0.0.0.0", port=9090)
+sub.add_proxy_route("/upstream", "http://localhost:4000")
+```
+
+#### Dynamic service announcement
+
+SubControllers can announce their HTTP endpoint to the Controller so it
+registers the route automatically:
+
+```python
+# On the SubController side:
+await sub.send_json({
+    "_announce_http": True,
+    "path_prefix": "/worker-a/api",
+    "upstream_url": "http://10.0.0.5:3001",
+})
+
+# On the Controller side (in the JSON handler):
+@ctrl.on(MessageType.JSON)
+async def on_json(peer_fp, data):
+    if data.get("_announce_http"):
+        ctrl.add_proxy_route_for_peer(
+            data["path_prefix"], peer_fp, data["upstream_url"]
+        )
+```
+
 ### Use cases and examples
 
 Runnable examples live in `examples/reverse-proxy/`:
@@ -332,9 +413,11 @@ Runnable examples live in `examples/reverse-proxy/`:
 | `multi_service_proxy` | Route multiple services by path prefix |
 | `dynamic_routes_proxy` | Add and remove routes while the proxy is running |
 | `versioned_api_proxy` | Route `/api/v1` and `/api/v2` to different backends |
-| `wire_with_proxy` | Run a Wire WebSocket controller alongside the HTTP proxy (Python) |
+| `wire_with_proxy` | Run a Wire WebSocket controller alongside the HTTP proxy |
+| `controller_proxy_routing` | **Controller + proxy routing to SubController HTTP services** |
+| `subcontroller_announce` | **SubController announces its HTTP service to Controller** |
 
-Each example is available in both **Python** (`.py`) and **Rust** (`.rs`).
+Python examples (`.py`) and Rust examples (`.rs`).
 
 ---
 

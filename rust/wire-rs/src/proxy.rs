@@ -50,7 +50,7 @@ fn is_hop_by_hop(name: &str) -> bool {
 }
 
 /// Shared route table: path-prefix → upstream base URL.
-type RouteTable = Arc<RwLock<HashMap<String, String>>>;
+pub type RouteTable = Arc<RwLock<HashMap<String, String>>>;
 
 pub struct ReverseProxy {
     host: String,
@@ -90,6 +90,14 @@ impl ReverseProxy {
     /// Return a snapshot of the current route table.
     pub async fn routes_snapshot(&self) -> HashMap<String, String> {
         self.routes.read().await.clone()
+    }
+
+    /// Return a clone of the underlying shared route table handle.
+    ///
+    /// This allows external code (e.g. the Controller) to remove routes
+    /// directly without holding a reference to the `ReverseProxy` struct.
+    pub fn routes_table(&self) -> RouteTable {
+        self.routes.clone()
     }
 
     /// Start the HTTP proxy server.

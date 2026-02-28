@@ -3,6 +3,7 @@
 
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
+use crate::proxy::ReverseProxy;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -39,6 +40,8 @@ pub struct SubController {
     message_tx: mpsc::UnboundedSender<WireMessage>,
     listen_handle: Option<tokio::task::JoinHandle<()>>,
     known_peers: Arc<RwLock<HashSet<String>>>,
+    // Embedded reverse proxy
+    proxy: Option<ReverseProxy>,
 }
 
 impl SubController {
@@ -55,6 +58,7 @@ impl SubController {
             message_tx,
             listen_handle: None,
             known_peers: Arc::new(RwLock::new(HashSet::new())),
+            proxy: None,
         }
     }
 
@@ -73,6 +77,51 @@ impl SubController {
     pub async fn known_peers(&self) -> Vec<String> {
         self.known_peers.read().await.iter().cloned().collect()
     }
+
+    // -- embedded reverse proxy -----------------------------------------------
+
+    /// Start an embedded HTTP reverse proxy on this SubController.
+    pub async fn enable_proxy(
+        &mut self,
+        host: &str,
+        port: u16,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut proxy = ReverseProxy::new(host, port);
+        proxy.start().await?;
+        self.proxy = Some(proxy);
+        info!("Embedded proxy enabled on http://{}:{}", host, port);
+        Ok(())
+    }
+
+    /// Stop the embedded proxy.
+    pub async fn disable_proxy(&mut self) {
+        if let Some(mut proxy) = self.proxy.take() {
+            proxy.stop().await;
+        }
+        info!("Embedded proxy disabled.");
+    }
+
+    /// Add a proxy route.
+    pub async fn add_proxy_route(&self, path_prefix: &str, upstream_url: &str) {
+        let proxy = self.proxy.as_ref().expect("Proxy not enabled. Call enable_proxy() first.");
+        proxy.add_route(path_prefix, upstream_url).await;
+    }
+
+    /// Remove a proxy route.
+    pub async fn remove_proxy_route(&self, path_prefix: &str) {
+        let proxy = self.proxy.as_ref().expect("Proxy not enabled. Call enable_proxy() first.");
+        proxy.remove_route(path_prefix).await;
+    }
+
+    /// Return a snapshot of the current proxy routes, or None if proxy is not enabled.
+    pub async fn proxy_routes(&self) -> Option<HashMap<String, String>> {
+        match self.proxy.as_ref() {
+            Some(proxy) => Some(proxy.routes_snapshot().await),
+            None => None,
+        }
+    }
+
+    // -- connection -----------------------------------------------------------
 
     pub async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("Generating TLS certificate...");
@@ -264,6 +313,9 @@ impl SubController {
     }
 
     pub async fn disconnect(&mut self) {
+        if let Some(mut proxy) = self.proxy.take() {
+            proxy.stop().await;
+        }
         if let Some(h) = self.listen_handle.take() {
             h.abort();
         }

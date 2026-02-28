@@ -31,6 +31,7 @@ from wire.protocol import (
     encode_frame,
     encode_relay_payload,
 )
+from wire.proxy import ReverseProxy
 
 logger = logging.getLogger("wire.subcontroller")
 
@@ -66,6 +67,9 @@ class SubController:
         # Known peers (other SubControllers connected to the same Controller)
         self._known_peers: set[str] = set()
 
+        # Embedded reverse proxy
+        self._proxy: ReverseProxy | None = None
+
     # -- public API ----------------------------------------------------------
 
     def on(self, msg_type: MessageType):
@@ -91,6 +95,45 @@ class SubController:
     def known_peers(self) -> list[str]:
         """List of fingerprints of other SubControllers connected to the Controller."""
         return list(self._known_peers)
+
+    # -- embedded reverse proxy -----------------------------------------------
+
+    async def enable_proxy(self, host: str = "0.0.0.0", port: int = 8080) -> None:
+        """Start an embedded HTTP reverse proxy on this SubController.
+
+        Useful when a SubController needs to expose upstream HTTP services
+        or act as a local gateway for traffic routed through the Wire mesh.
+        """
+        self._proxy = ReverseProxy(host=host, port=port)
+        await self._proxy.start()
+        logger.info("Embedded proxy enabled on http://%s:%d", host, port)
+
+    async def disable_proxy(self) -> None:
+        """Stop the embedded proxy if running."""
+        if self._proxy:
+            await self._proxy.stop()
+            self._proxy = None
+
+    def add_proxy_route(self, path_prefix: str, upstream_url: str) -> None:
+        """Add a proxy route on this SubController's embedded proxy."""
+        if self._proxy is None:
+            raise RuntimeError("Proxy not enabled. Call enable_proxy() first.")
+        self._proxy.add_route(path_prefix, upstream_url)
+
+    def remove_proxy_route(self, path_prefix: str) -> None:
+        """Remove a proxy route."""
+        if self._proxy is None:
+            raise RuntimeError("Proxy not enabled. Call enable_proxy() first.")
+        self._proxy.remove_route(path_prefix)
+
+    @property
+    def proxy_routes(self) -> dict[str, str] | None:
+        """Return current proxy route table, or None if proxy is not enabled."""
+        if self._proxy is None:
+            return None
+        return self._proxy.routes
+
+    # -- connection -----------------------------------------------------------
 
     async def connect(self):
         """Generate certs, connect to the controller, and authenticate."""
@@ -118,7 +161,10 @@ class SubController:
         self._listen_task = asyncio.create_task(self._listen_loop())
 
     async def disconnect(self):
-        """Close the WebSocket connection."""
+        """Close the WebSocket connection and stop the embedded proxy."""
+        if self._proxy:
+            await self._proxy.stop()
+            self._proxy = None
         if self._listen_task:
             self._listen_task.cancel()
             try:

@@ -33,6 +33,7 @@ from wire.protocol import (
     encode_frame,
     encode_relay_payload,
 )
+from wire.proxy import ReverseProxy
 
 logger = logging.getLogger("wire.controller")
 
@@ -71,6 +72,12 @@ class Controller:
         self._server: Any = None
         self._serve_task: asyncio.Task | None = None
 
+        # Embedded reverse proxy
+        self._proxy: ReverseProxy | None = None
+        # Tracks which proxy routes belong to which peer fingerprint
+        # peer_fp -> list of path_prefixes
+        self._peer_proxy_routes: dict[str, list[str]] = {}
+
     # -- public API ----------------------------------------------------------
 
     def on(self, msg_type: MessageType):
@@ -103,7 +110,10 @@ class Controller:
         logger.info("Controller listening on wss://%s:%d", self.host, self.port)
 
     async def stop(self):
-        """Shut down the server."""
+        """Shut down the server and embedded proxy (if running)."""
+        if self._proxy:
+            await self._proxy.stop()
+            self._proxy = None
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -147,6 +157,77 @@ class Controller:
     @property
     def peer_fingerprints(self) -> list[str]:
         return list(self._peers.keys())
+
+    # -- embedded reverse proxy -----------------------------------------------
+
+    async def enable_proxy(self, host: str = "0.0.0.0", port: int = 8080) -> None:
+        """Start an embedded HTTP reverse proxy alongside the WebSocket server.
+
+        Once enabled, use ``add_proxy_route`` or ``add_proxy_route_for_peer``
+        to map URL path prefixes to upstream HTTP(S) services.
+        """
+        self._proxy = ReverseProxy(host=host, port=port)
+        await self._proxy.start()
+        logger.info("Embedded proxy enabled on http://%s:%d", host, port)
+
+    async def disable_proxy(self) -> None:
+        """Stop the embedded proxy if running."""
+        if self._proxy:
+            await self._proxy.stop()
+            self._proxy = None
+            self._peer_proxy_routes.clear()
+            logger.info("Embedded proxy disabled.")
+
+    def add_proxy_route(self, path_prefix: str, upstream_url: str) -> None:
+        """Add a static proxy route (not tied to any peer lifecycle)."""
+        if self._proxy is None:
+            raise RuntimeError("Proxy not enabled. Call enable_proxy() first.")
+        self._proxy.add_route(path_prefix, upstream_url)
+
+    def remove_proxy_route(self, path_prefix: str) -> None:
+        """Remove a proxy route."""
+        if self._proxy is None:
+            raise RuntimeError("Proxy not enabled. Call enable_proxy() first.")
+        self._proxy.remove_route(path_prefix)
+
+    def add_proxy_route_for_peer(
+        self, path_prefix: str, peer_fp: str, upstream_url: str
+    ) -> None:
+        """Add a proxy route tied to a connected peer's lifecycle.
+
+        When the peer identified by *peer_fp* disconnects, the route is
+        automatically removed.  This is the primary way to expose a
+        SubController's HTTP service through the Controller's proxy.
+
+        Example::
+
+            # SubController "worker-1" runs an HTTP API on port 3000.
+            ctrl.add_proxy_route_for_peer(
+                "/worker1/api",
+                worker1_fp,
+                "http://worker1-host:3000",
+            )
+            # GET http://controller:8080/worker1/api/health
+            #   → forwarded to http://worker1-host:3000/health
+
+        """
+        if self._proxy is None:
+            raise RuntimeError("Proxy not enabled. Call enable_proxy() first.")
+        self._proxy.add_route(path_prefix, upstream_url)
+        self._peer_proxy_routes.setdefault(peer_fp, []).append(path_prefix)
+        logger.info(
+            "Proxy route %s -> %s bound to peer %s",
+            path_prefix,
+            upstream_url,
+            peer_fp[:16] + "...",
+        )
+
+    @property
+    def proxy_routes(self) -> dict[str, str] | None:
+        """Return current proxy route table, or None if proxy is not enabled."""
+        if self._proxy is None:
+            return None
+        return self._proxy.routes
 
     # -- internal ------------------------------------------------------------
 
@@ -339,6 +420,16 @@ class Controller:
                 await ws.send(frame)
             except Exception:
                 pass
+
+        # Clean up proxy routes bound to this peer
+        if self._proxy and gone_fp in self._peer_proxy_routes:
+            for prefix in self._peer_proxy_routes.pop(gone_fp):
+                self._proxy.remove_route(prefix)
+                logger.info(
+                    "Auto-removed proxy route %s (peer %s left)",
+                    prefix,
+                    gone_fp[:16] + "...",
+                )
 
     async def _send_payload_streamed(
         self, ws, msg_type: MessageType, payload: bytes
