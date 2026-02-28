@@ -325,16 +325,23 @@ class Controller:
             await self._handle_relay(peer_fp, payload)
             return
 
-        # Non-streamed messages
+        # Non-streamed messages — intercept built-in proxy route requests
+        if header.msg_type == MessageType.JSON:
+            data = json.loads(payload)
+            if "_wire_proxy_route" in data:
+                await self._handle_proxy_route_request(peer_fp, data["_wire_proxy_route"])
+                return
+            handler = self._handlers.get(header.msg_type)
+            if handler:
+                await handler(peer_fp, data)
+            return
+
         handler = self._handlers.get(header.msg_type)
         if handler is None:
             logger.debug("No handler for message type %s", header.msg_type)
             return
 
-        if header.msg_type == MessageType.JSON:
-            data = json.loads(payload)
-            await handler(peer_fp, data)
-        elif header.msg_type in (MessageType.FILE, MessageType.IMAGE):
+        if header.msg_type in (MessageType.FILE, MessageType.IMAGE):
             filename, file_data = decode_file_payload(payload)
             await handler(peer_fp, filename, file_data)
         elif header.msg_type == MessageType.BINARY:
@@ -387,6 +394,71 @@ class Controller:
         # Re-wrap with the actual sender fingerprint (don't trust client-supplied source)
         relay_out = encode_relay_payload(sender_fp, dest_fp, inner_type, inner_payload)
         await self._send_payload_streamed(ws, MessageType.RELAY, relay_out)
+
+    async def _handle_proxy_route_request(self, requester_fp: str, route_cfg: dict):
+        """Handle a ``_wire_proxy_route`` request from a SubController.
+
+        This is part of the built-in Wire protocol — SubControllers can
+        configure the Controller's reverse proxy without the Controller
+        needing any custom handler code.
+        """
+        action = route_cfg.get("action")
+        path_prefix = route_cfg.get("path_prefix", "")
+
+        if action == "add":
+            peer_fp = route_cfg.get("peer_fp", requester_fp)
+            upstream_url = route_cfg.get("upstream_url", "")
+
+            if self._proxy is None:
+                logger.warning(
+                    "Proxy route request from %s rejected: proxy not enabled",
+                    requester_fp[:16] + "...",
+                )
+                await self.send_json(requester_fp, {
+                    "_wire_proxy_route_result": {
+                        "ok": False,
+                        "error": "Proxy not enabled on controller",
+                        "path_prefix": path_prefix,
+                    }
+                })
+                return
+
+            self.add_proxy_route_for_peer(path_prefix, peer_fp, upstream_url)
+            await self.send_json(requester_fp, {
+                "_wire_proxy_route_result": {
+                    "ok": True,
+                    "action": "add",
+                    "path_prefix": path_prefix,
+                    "upstream_url": upstream_url,
+                    "peer_fp": peer_fp,
+                }
+            })
+
+        elif action == "remove":
+            if self._proxy is None:
+                await self.send_json(requester_fp, {
+                    "_wire_proxy_route_result": {
+                        "ok": False,
+                        "error": "Proxy not enabled on controller",
+                        "path_prefix": path_prefix,
+                    }
+                })
+                return
+
+            self.remove_proxy_route(path_prefix)
+            # Also remove from peer-bound tracking
+            for prefixes in self._peer_proxy_routes.values():
+                if path_prefix in prefixes:
+                    prefixes.remove(path_prefix)
+            await self.send_json(requester_fp, {
+                "_wire_proxy_route_result": {
+                    "ok": True,
+                    "action": "remove",
+                    "path_prefix": path_prefix,
+                }
+            })
+        else:
+            logger.warning("Unknown proxy route action: %s", action)
 
     async def _notify_peer_joined(self, new_fp: str):
         """Tell all existing peers about the new peer, and tell the new

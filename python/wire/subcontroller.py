@@ -195,6 +195,57 @@ class SubController:
         file_payload = encode_file_payload(filename, data)
         await self._send_payload_streamed(self._ws, msg_type, file_payload)
 
+    # -- remote proxy route requests ------------------------------------------
+
+    async def request_proxy_route(
+        self,
+        path_prefix: str,
+        peer_fp: str,
+        upstream_url: str,
+    ) -> None:
+        """Ask the Controller to add a proxy route.
+
+        One call does everything — the Controller's embedded proxy will
+        route ``path_prefix`` to ``upstream_url``, bound to the peer
+        identified by ``peer_fp`` (auto-removed when that peer disconnects).
+
+        Args:
+            path_prefix: URL path prefix on the Controller's proxy,
+                e.g. ``"/api"``
+            peer_fp: Fingerprint of the peer whose lifecycle the route
+                is tied to.  Use ``self.cert_bundle.fingerprint`` to bind
+                to yourself.
+            upstream_url: Where the traffic should actually go,
+                e.g. ``"https://10.0.0.5:3001/v2"``
+
+        Example::
+
+            await sub.request_proxy_route(
+                "/my-api",
+                sub.cert_bundle.fingerprint,
+                "http://localhost:3001",
+            )
+            # Now:  GET http://controller:8080/my-api/health
+            #   →   forwarded to http://localhost:3001/health
+        """
+        await self.send_json({
+            "_wire_proxy_route": {
+                "action": "add",
+                "path_prefix": path_prefix,
+                "peer_fp": peer_fp,
+                "upstream_url": upstream_url,
+            }
+        })
+
+    async def request_remove_proxy_route(self, path_prefix: str) -> None:
+        """Ask the Controller to remove a proxy route."""
+        await self.send_json({
+            "_wire_proxy_route": {
+                "action": "remove",
+                "path_prefix": path_prefix,
+            }
+        })
+
     # -- peer-to-peer via relay ----------------------------------------------
 
     async def send_json_to_peer(self, dest_fp: str, data: Any):

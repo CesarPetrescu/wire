@@ -507,6 +507,24 @@ async fn handle_connection(
                     // Relay messages need special handling
                     if mt == MessageType::Relay {
                         handle_relay(&peer_fp, &full, &senders).await;
+                    } else if mt == MessageType::Json {
+                        // Check for proxy route request in streamed JSON
+                        if let Ok(data) = serde_json::from_slice::<Value>(&full) {
+                            if data.get("_wire_proxy_route").is_some() {
+                                handle_proxy_route_request(
+                                    &peer_fp,
+                                    &data["_wire_proxy_route"],
+                                    &peer_proxy_routes,
+                                    &proxy_routes_table,
+                                    &senders,
+                                )
+                                .await;
+                            } else {
+                                dispatch_message(&peer_fp, mt, &full, &msg_tx);
+                            }
+                        } else {
+                            dispatch_message(&peer_fp, mt, &full, &msg_tx);
+                        }
                     } else {
                         dispatch_message(&peer_fp, mt, &full, &msg_tx);
                     }
@@ -519,6 +537,23 @@ async fn handle_connection(
         if header.msg_type == MessageType::Relay {
             handle_relay(&peer_fp, &payload, &senders).await;
             continue;
+        }
+
+        // Intercept _wire_proxy_route requests (built-in protocol)
+        if header.msg_type == MessageType::Json {
+            if let Ok(data) = serde_json::from_slice::<Value>(&payload) {
+                if data.get("_wire_proxy_route").is_some() {
+                    handle_proxy_route_request(
+                        &peer_fp,
+                        &data["_wire_proxy_route"],
+                        &peer_proxy_routes,
+                        &proxy_routes_table,
+                        &senders,
+                    )
+                    .await;
+                    continue;
+                }
+            }
         }
 
         dispatch_message(&peer_fp, header.msg_type, &payload, &msg_tx);
@@ -587,6 +622,151 @@ async fn handle_relay(
     let relay_out = encode_relay_payload(sender_fp, &dest_fp, inner_type, &inner_payload);
     if let Err(e) = send_payload_via_tx(dest_tx, MessageType::Relay, &relay_out) {
         error!("Relay forward error: {}", e);
+    }
+}
+
+/// Handle a `_wire_proxy_route` request from a SubController.
+///
+/// This is part of the built-in Wire protocol — SubControllers can configure
+/// the Controller's reverse proxy without custom handler code.
+async fn handle_proxy_route_request(
+    requester_fp: &str,
+    route_cfg: &Value,
+    peer_proxy_routes: &Arc<RwLock<HashMap<String, Vec<String>>>>,
+    proxy_routes_table: &Option<crate::proxy::RouteTable>,
+    senders: &Arc<RwLock<HashMap<String, PeerSender>>>,
+) {
+    let action = route_cfg["action"].as_str().unwrap_or("");
+    let path_prefix = route_cfg["path_prefix"].as_str().unwrap_or("");
+
+    let send_result = |result: Value| {
+        let senders = senders.clone();
+        let fp = requester_fp.to_string();
+        async move {
+            let payload = serde_json::to_vec(&result).unwrap_or_default();
+            if let Ok(frame) = encode_frame(MessageType::Json, &payload, None, Flags::NONE, true) {
+                let senders_read = senders.read().await;
+                if let Some(tx) = senders_read.get(&fp) {
+                    let _ = tx.send(frame);
+                }
+            }
+        }
+    };
+
+    match action {
+        "add" => {
+            let peer_fp = route_cfg["peer_fp"]
+                .as_str()
+                .unwrap_or(requester_fp);
+            let upstream_url = route_cfg["upstream_url"].as_str().unwrap_or("");
+
+            let proxy_table = match proxy_routes_table {
+                Some(t) => t,
+                None => {
+                    warn!(
+                        "Proxy route request from {}... rejected: proxy not enabled",
+                        &requester_fp[..16.min(requester_fp.len())]
+                    );
+                    send_result(serde_json::json!({
+                        "_wire_proxy_route_result": {
+                            "ok": false,
+                            "error": "Proxy not enabled on controller",
+                            "path_prefix": path_prefix,
+                        }
+                    }))
+                    .await;
+                    return;
+                }
+            };
+
+            // Normalise and insert the route
+            let normalised = if path_prefix == "/" || path_prefix.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", path_prefix.trim_matches('/'))
+            };
+            let upstream = upstream_url.trim_end_matches('/').to_string();
+
+            proxy_table
+                .write()
+                .await
+                .insert(normalised.clone(), upstream.clone());
+
+            // Track as peer-bound route
+            peer_proxy_routes
+                .write()
+                .await
+                .entry(peer_fp.to_string())
+                .or_default()
+                .push(normalised.clone());
+
+            info!(
+                "Proxy route {} -> {} bound to peer {}... (requested by {}...)",
+                normalised,
+                upstream,
+                &peer_fp[..16.min(peer_fp.len())],
+                &requester_fp[..16.min(requester_fp.len())]
+            );
+
+            send_result(serde_json::json!({
+                "_wire_proxy_route_result": {
+                    "ok": true,
+                    "action": "add",
+                    "path_prefix": normalised,
+                    "upstream_url": upstream,
+                    "peer_fp": peer_fp,
+                }
+            }))
+            .await;
+        }
+        "remove" => {
+            let proxy_table = match proxy_routes_table {
+                Some(t) => t,
+                None => {
+                    send_result(serde_json::json!({
+                        "_wire_proxy_route_result": {
+                            "ok": false,
+                            "error": "Proxy not enabled on controller",
+                            "path_prefix": path_prefix,
+                        }
+                    }))
+                    .await;
+                    return;
+                }
+            };
+
+            let normalised = if path_prefix == "/" || path_prefix.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/{}", path_prefix.trim_matches('/'))
+            };
+
+            proxy_table.write().await.remove(&normalised);
+
+            // Remove from peer-bound tracking
+            let mut ppr = peer_proxy_routes.write().await;
+            for prefixes in ppr.values_mut() {
+                prefixes.retain(|p| p != &normalised);
+            }
+
+            info!(
+                "Proxy route {} removed (requested by {}...)",
+                normalised,
+                &requester_fp[..16.min(requester_fp.len())]
+            );
+
+            send_result(serde_json::json!({
+                "_wire_proxy_route_result": {
+                    "ok": true,
+                    "action": "remove",
+                    "path_prefix": normalised,
+                }
+            }))
+            .await;
+        }
+        _ => {
+            warn!("Unknown proxy route action: {}", action);
+        }
     }
 }
 

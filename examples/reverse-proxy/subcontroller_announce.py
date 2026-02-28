@@ -1,9 +1,11 @@
 """
-SubController that announces its HTTP service to the Controller's proxy.
+SubController that registers a proxy route on the Controller — one call.
 
-This SubController runs a local HTTP API (simulated here) and tells the
-Controller to register a proxy route for it.  Pair with
-``controller_proxy_routing.py``.
+After connecting, calls ``request_proxy_route()`` which tells the Controller:
+  "Route /worker-a/api on your proxy to http://localhost:3001, and tie that
+   route to MY fingerprint (auto-remove when I disconnect)."
+
+The Controller needs NO custom code — it handles the request automatically.
 
 Usage:
     python subcontroller_announce.py
@@ -21,26 +23,33 @@ async def main():
     )
     await sub.connect()
 
-    # Tell the Controller to route /worker-a/api to our local HTTP service
-    await sub.send_json({
-        "_announce_http": True,
-        "path_prefix": "/worker-a/api",
-        "upstream_url": "http://localhost:3001",  # our local HTTP service
-    })
+    # One call configures everything on the Controller's proxy.
+    # - path_prefix:  what URL prefix on the controller to listen on
+    # - peer_fp:      whose lifecycle the route is tied to (ourselves)
+    # - upstream_url: where the traffic actually goes
+    await sub.request_proxy_route(
+        "/worker-a/api",                    # path on controller's proxy
+        sub.cert_bundle.fingerprint,        # bind to our own lifecycle
+        "http://localhost:3001",            # our local HTTP service
+    )
 
     @sub.on(MessageType.JSON)
     async def on_json(data):
-        if data.get("proxy_registered"):
-            print(
-                f"Controller confirmed proxy route: "
-                f"{data['path_prefix']}"
-            )
+        # The Controller sends back a confirmation
+        result = data.get("_wire_proxy_route_result")
+        if result:
+            if result["ok"]:
+                print(f"Route registered: {result['path_prefix']} -> {result['upstream_url']}")
+            else:
+                print(f"Route failed: {result['error']}")
         else:
             print(f"Received: {data}")
 
-    print("SubController connected. HTTP service announced to Controller proxy.")
+    print("SubController connected.")
     print("Requests to http://controller:8080/worker-a/api/...")
     print("  will be forwarded to http://localhost:3001/...")
+    print()
+    print("Disconnect (Ctrl+C) and the route is auto-removed.")
 
     try:
         await asyncio.Future()

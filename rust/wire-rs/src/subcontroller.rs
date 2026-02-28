@@ -355,6 +355,44 @@ impl SubController {
         self.send_payload_streamed(msg_type, &file_payload).await
     }
 
+    // -- remote proxy route requests ------------------------------------------
+
+    /// Ask the Controller to add a proxy route.
+    ///
+    /// One call does everything — the Controller's embedded proxy will route
+    /// `path_prefix` to `upstream_url`, bound to the peer identified by
+    /// `peer_fp` (auto-removed when that peer disconnects).
+    pub async fn request_proxy_route(
+        &self,
+        path_prefix: &str,
+        peer_fp: &str,
+        upstream_url: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = serde_json::json!({
+            "_wire_proxy_route": {
+                "action": "add",
+                "path_prefix": path_prefix,
+                "peer_fp": peer_fp,
+                "upstream_url": upstream_url,
+            }
+        });
+        self.send_json(&msg).await
+    }
+
+    /// Ask the Controller to remove a proxy route.
+    pub async fn request_remove_proxy_route(
+        &self,
+        path_prefix: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let msg = serde_json::json!({
+            "_wire_proxy_route": {
+                "action": "remove",
+                "path_prefix": path_prefix,
+            }
+        });
+        self.send_json(&msg).await
+    }
+
     // -- peer-to-peer via relay -----------------------------------------------
 
     pub async fn send_json_to_peer(

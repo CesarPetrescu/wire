@@ -328,11 +328,6 @@ The reverse proxy can be **embedded directly** into a Controller or
 SubController.  This is the recommended way to expose connected peers' HTTP
 services through a single gateway.
 
-**Key concept — peer-bound routes:**
-`add_proxy_route_for_peer(path, peer_fp, upstream_url)` ties a route to a
-connected SubController.  When that SubController disconnects, the route is
-**automatically removed**.
-
 ```text
 Browser / curl
     |
@@ -344,63 +339,65 @@ SubCtrl-A    SubCtrl-B    SubCtrl-C
 (API :3001)  (API :3002)  (Dashboard :3003)
 ```
 
-#### Python — Controller with proxy
+#### Message-driven routing (recommended)
+
+SubControllers configure routes remotely with **one call** — the Controller
+needs **zero custom handler code**.  The `_wire_proxy_route` message is a
+built-in Wire protocol feature, handled automatically.
+
+**Python — Controller (only two lines needed):**
 
 ```python
 ctrl = Controller(host="0.0.0.0", port=8765, preshared_secret="s3cret")
 await ctrl.start()
-await ctrl.enable_proxy(host="0.0.0.0", port=8080)
+await ctrl.enable_proxy(host="0.0.0.0", port=8080)   # that's it
+```
 
+**Python — SubController (one call configures everything):**
+
+```python
+sub = SubController(controller_url="wss://controller:8765", preshared_secret="s3cret")
+await sub.connect()
+
+# Tell the Controller: "route /my-api on your proxy to http://10.0.0.5:3001,
+# and tie that route to MY fingerprint (auto-remove when I disconnect)"
+await sub.request_proxy_route(
+    "/my-api",                       # path prefix on the Controller's proxy
+    sub.cert_bundle.fingerprint,     # bind to our own lifecycle
+    "http://10.0.0.5:3001",         # where traffic actually goes
+)
+# GET http://controller:8080/my-api/health → http://10.0.0.5:3001/health
+```
+
+**Rust — same pattern:**
+
+```rust
+// Controller
+let mut ctrl = Controller::new("0.0.0.0", 8765, "s3cret");
+ctrl.start().await?;
+ctrl.enable_proxy("0.0.0.0", 8080).await?;
+
+// SubController
+let mut sub = SubController::new("127.0.0.1", 8765, "s3cret");
+sub.connect().await?;
+let my_fp = sub.fingerprint().unwrap();
+sub.request_proxy_route("/my-api", &my_fp, "http://10.0.0.5:3001").await?;
+```
+
+The Controller sends back a `_wire_proxy_route_result` confirmation with
+`ok: true/false` and error details.
+
+#### Programmatic API (for direct control)
+
+When you need more control, the Controller can also manage routes
+directly in code:
+
+```python
 # Static route (always active)
 ctrl.add_proxy_route("/status", "http://monitoring:9090")
 
 # Peer-bound route — auto-removed when the SubController disconnects
 ctrl.add_proxy_route_for_peer("/worker-a/api", worker_a_fp, "http://10.0.0.5:3001")
-
-# GET http://controller:8080/worker-a/api/health
-#   → forwarded to http://10.0.0.5:3001/health
-```
-
-#### Rust — Controller with proxy
-
-```rust
-let mut ctrl = Controller::new("0.0.0.0", 8765, "s3cret");
-ctrl.start().await?;
-ctrl.enable_proxy("0.0.0.0", 8080).await?;
-
-ctrl.add_proxy_route("/status", "http://monitoring:9090").await;
-ctrl.add_proxy_route_for_peer("/worker-a/api", &worker_a_fp, "http://10.0.0.5:3001").await;
-```
-
-#### Python — SubController with its own proxy
-
-```python
-sub = SubController(controller_url="wss://controller:8765", preshared_secret="s3cret")
-await sub.connect()
-await sub.enable_proxy(host="0.0.0.0", port=9090)
-sub.add_proxy_route("/upstream", "http://localhost:4000")
-```
-
-#### Dynamic service announcement
-
-SubControllers can announce their HTTP endpoint to the Controller so it
-registers the route automatically:
-
-```python
-# On the SubController side:
-await sub.send_json({
-    "_announce_http": True,
-    "path_prefix": "/worker-a/api",
-    "upstream_url": "http://10.0.0.5:3001",
-})
-
-# On the Controller side (in the JSON handler):
-@ctrl.on(MessageType.JSON)
-async def on_json(peer_fp, data):
-    if data.get("_announce_http"):
-        ctrl.add_proxy_route_for_peer(
-            data["path_prefix"], peer_fp, data["upstream_url"]
-        )
 ```
 
 ### Use cases and examples

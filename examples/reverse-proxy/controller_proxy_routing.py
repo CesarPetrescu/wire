@@ -1,9 +1,10 @@
 """
-Controller with integrated reverse proxy — route HTTP traffic to SubController services.
+Controller with integrated reverse proxy — ZERO custom handler code.
 
-This example shows the main use case: a Controller runs a reverse proxy that
-routes HTTP requests to HTTP services running on (or alongside) its connected
-SubControllers.
+The Controller just calls ``enable_proxy()`` and SubControllers configure
+routes remotely via ``request_proxy_route()``.  The Controller handles
+``_wire_proxy_route`` messages automatically as a built-in Wire protocol
+feature.
 
 Topology:
 
@@ -16,65 +17,45 @@ Topology:
     SubCtrl-A    SubCtrl-B    SubCtrl-C
     (API :3001)  (API :3002)  (Dashboard :3003)
 
-When a SubController connects, we register a proxy route.
-When it disconnects, the route is automatically removed.
+When a SubController disconnects, its routes are automatically removed.
 
 Usage:
+    # Terminal 1 — start the controller
     python controller_proxy_routing.py
+
+    # Terminal 2 — start a subcontroller (see subcontroller_announce.py)
+    python subcontroller_announce.py
+
+    # Terminal 3 — test
+    curl http://localhost:8080/worker-a/api/health
 """
 
 import asyncio
-import json
 
 from wire import Controller, MessageType
 
 
 async def main():
     ctrl = Controller(host="0.0.0.0", port=8765, preshared_secret="my-secret")
-
-    # Enable the reverse proxy on port 8080
     await ctrl.start()
+
+    # This is ALL you need on the Controller side.
+    # SubControllers will configure routes remotely.
     await ctrl.enable_proxy(host="0.0.0.0", port=8080)
 
-    # Track which peer offers which service
-    # In real usage, SubControllers would announce their HTTP endpoint
-    # via a JSON message after connecting.
-
+    # Optional: handle normal application messages
     @ctrl.on(MessageType.JSON)
     async def on_json(peer_fp, data):
-        # SubControllers announce their HTTP service with a special message
-        if data.get("_announce_http"):
-            path_prefix = data["path_prefix"]   # e.g. "/worker-a/api"
-            upstream_url = data["upstream_url"]  # e.g. "http://10.0.0.5:3001"
-
-            ctrl.add_proxy_route_for_peer(path_prefix, peer_fp, upstream_url)
-            print(
-                f"Registered proxy: {path_prefix} -> {upstream_url} "
-                f"(peer {peer_fp[:16]}...)"
-            )
-
-            # Confirm to the SubController
-            await ctrl.send_json(peer_fp, {
-                "proxy_registered": True,
-                "path_prefix": path_prefix,
-            })
-            return
-
-        # Normal application messages
-        print(f"JSON from {peer_fp[:16]}: {data}")
+        print(f"JSON from {peer_fp[:16]}...: {data}")
 
     print("Controller running:")
     print("  WSS on wss://0.0.0.0:8765")
     print("  HTTP proxy on http://0.0.0.0:8080")
     print()
-    print("SubControllers can announce their HTTP services by sending:")
-    print('  {"_announce_http": true, "path_prefix": "/my-api", '
-          '"upstream_url": "http://host:port"}')
+    print("SubControllers can configure proxy routes with one call:")
+    print('  await sub.request_proxy_route("/my-api", my_fp, "http://host:port")')
     print()
-    print("The proxy will then forward:")
-    print("  http://controller:8080/my-api/... -> http://host:port/...")
-    print()
-    print("When a SubController disconnects, its routes are auto-removed.")
+    print("Routes are auto-removed when the SubController disconnects.")
 
     try:
         await asyncio.Future()
