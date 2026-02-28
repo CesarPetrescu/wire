@@ -5,6 +5,7 @@ from wire.certs import generate_self_signed_cert, get_cert_fingerprint
 from wire.controller import Controller
 from wire.subcontroller import SubController
 from wire.proxy import ReverseProxy
+from wire.tunnel import ProxyTunnel
 
 __all__ = [
     "MessageType",
@@ -17,4 +18,5 @@ __all__ = [
     "Controller",
     "SubController",
     "ReverseProxy",
+    "ProxyTunnel",
 ]

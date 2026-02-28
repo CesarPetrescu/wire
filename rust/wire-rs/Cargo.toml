@@ -27,6 +27,7 @@ http = "1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-legacy", "server-auto"] }
 http-body-util = "0.1"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -400,6 +400,51 @@ ctrl.add_proxy_route("/status", "http://monitoring:9090")
 ctrl.add_proxy_route_for_peer("/worker-a/api", worker_a_fp, "http://10.0.0.5:3001")
 ```
 
+### Proxy tunnels (HTTP through Wire mesh)
+
+`open_proxy_tunnel()` creates a full **two-hop HTTP tunnel** through the
+Wire mesh.  The calling node starts a local HTTP listener; requests are
+serialised, sent through Wire to a target peer, and that peer makes the
+actual HTTP call to the upstream backend.  Responses flow back the same
+path.
+
+```text
+curl http://localhost:9090/api/users
+    |
+    v
+SubController A  (HTTP listener :9090)
+    |  <-- Wire mesh (relay or direct) -->
+    v
+SubController B  (forward proxy)
+    |
+    v
+http://backend:3000/users  (the real service)
+```
+
+**Python — one call from any SubController or Controller:**
+
+```python
+# SubController A opens a tunnel:
+# - listens on 0.0.0.0:9090
+# - forwards /api/* through Wire to target peer B
+# - B makes the HTTP call to http://10.0.0.5:3000/*
+tunnel = await sub_a.open_proxy_tunnel(
+    "0.0.0.0", 9090, "/api",
+    target_fp=sub_b_fingerprint,
+    upstream_url="http://10.0.0.5:3000",
+)
+# curl http://localhost:9090/api/health
+#   → Wire → peer B → http://10.0.0.5:3000/health → response → Wire → client
+
+# Close the tunnel when done
+await sub_a.close_proxy_tunnel(tunnel)
+```
+
+The target peer handles `_wire_tunnel_req` messages **automatically** —
+no code needed on the target side.  This works across Python and Rust
+nodes (a Python SubController can tunnel through a Rust Controller and
+vice versa).
+
 ### Use cases and examples
 
 Runnable examples live in `examples/reverse-proxy/`:
@@ -411,8 +456,10 @@ Runnable examples live in `examples/reverse-proxy/`:
 | `dynamic_routes_proxy` | Add and remove routes while the proxy is running |
 | `versioned_api_proxy` | Route `/api/v1` and `/api/v2` to different backends |
 | `wire_with_proxy` | Run a Wire WebSocket controller alongside the HTTP proxy |
-| `controller_proxy_routing` | **Controller + proxy routing to SubController HTTP services** |
-| `subcontroller_announce` | **SubController announces its HTTP service to Controller** |
+| `controller_proxy_routing` | **Controller + zero-code proxy routing** |
+| `subcontroller_announce` | **SubController configures routes remotely** |
+| `tunnel_controller` | **Controller as tunnel target** |
+| `tunnel_subcontroller` | **SubController opens a proxy tunnel through Wire** |
 
 Python examples (`.py`) and Rust examples (`.rs`).
 

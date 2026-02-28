@@ -4,6 +4,7 @@
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
 use crate::proxy::ReverseProxy;
+use crate::tunnel;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -233,6 +234,8 @@ impl SubController {
         // Spawn reader
         let msg_tx = self.message_tx.clone();
         let known_peers = self.known_peers.clone();
+        let sender_for_reader = self.sender.clone();
+        let my_fingerprint = bundle.fingerprint.clone();
         let listen_handle = tokio::spawn(async move {
             let stream_buffers: HashMap<[u8; 16], Vec<Vec<u8>>> = HashMap::new();
             let stream_meta: HashMap<[u8; 16], MessageType> = HashMap::new();
@@ -298,8 +301,77 @@ impl SubController {
 
                 // Non-streamed relay
                 if header.msg_type == MessageType::Relay {
+                    if let Ok((source_fp, _dest_fp, inner_type, inner_payload)) =
+                        decode_relay_payload(&payload)
+                    {
+                        // Intercept tunnel requests in relay messages
+                        if inner_type == MessageType::Json {
+                            if let Ok(data) = serde_json::from_slice::<Value>(&inner_payload) {
+                                if data.get("_wire_tunnel_req").is_some() {
+                                    let sender_c = sender_for_reader.clone();
+                                    let my_fp = my_fingerprint.clone();
+                                    let src_fp = source_fp.clone();
+                                    tokio::spawn(async move {
+                                        let resp = tunnel::execute_tunnel_request(
+                                            &data["_wire_tunnel_req"],
+                                        )
+                                        .await;
+                                        let inner = serde_json::to_vec(&resp).unwrap_or_default();
+                                        let relay_out = encode_relay_payload(
+                                            &my_fp,
+                                            &src_fp,
+                                            MessageType::Json,
+                                            &inner,
+                                        );
+                                        if let Ok(frame) = encode_frame(
+                                            MessageType::Relay,
+                                            &relay_out,
+                                            None,
+                                            Flags::NONE,
+                                            true,
+                                        ) {
+                                            let s = sender_c.read().await;
+                                            if let Some(tx) = s.as_ref() {
+                                                let _ = tx.send(frame);
+                                            }
+                                        }
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     dispatch_relay(&payload, &msg_tx);
                     continue;
+                }
+
+                // Intercept tunnel requests in direct JSON from Controller
+                if header.msg_type == MessageType::Json {
+                    if let Ok(data) = serde_json::from_slice::<Value>(&payload) {
+                        if data.get("_wire_tunnel_req").is_some() {
+                            let sender_c = sender_for_reader.clone();
+                            tokio::spawn(async move {
+                                let resp = tunnel::execute_tunnel_request(
+                                    &data["_wire_tunnel_req"],
+                                )
+                                .await;
+                                let payload = serde_json::to_vec(&resp).unwrap_or_default();
+                                if let Ok(frame) = encode_frame(
+                                    MessageType::Json,
+                                    &payload,
+                                    None,
+                                    Flags::NONE,
+                                    true,
+                                ) {
+                                    let s = sender_c.read().await;
+                                    if let Some(tx) = s.as_ref() {
+                                        let _ = tx.send(frame);
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+                    }
                 }
 
                 dispatch_sub_message(header.msg_type, &payload, &msg_tx, &known_peers).await;

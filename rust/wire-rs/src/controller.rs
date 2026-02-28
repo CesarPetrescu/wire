@@ -4,6 +4,7 @@
 use crate::certs::{self, CertBundle};
 use crate::protocol::*;
 use crate::proxy::ReverseProxy;
+use crate::tunnel;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -508,7 +509,7 @@ async fn handle_connection(
                     if mt == MessageType::Relay {
                         handle_relay(&peer_fp, &full, &senders).await;
                     } else if mt == MessageType::Json {
-                        // Check for proxy route request in streamed JSON
+                        // Check for built-in protocol messages in streamed JSON
                         if let Ok(data) = serde_json::from_slice::<Value>(&full) {
                             if data.get("_wire_proxy_route").is_some() {
                                 handle_proxy_route_request(
@@ -519,6 +520,24 @@ async fn handle_connection(
                                     &senders,
                                 )
                                 .await;
+                            } else if data.get("_wire_tunnel_req").is_some() {
+                                let senders_clone = senders.clone();
+                                let peer_fp_clone = peer_fp.clone();
+                                tokio::spawn(async move {
+                                    let resp = tunnel::execute_tunnel_request(
+                                        &data["_wire_tunnel_req"],
+                                    )
+                                    .await;
+                                    let payload = serde_json::to_vec(&resp).unwrap_or_default();
+                                    if let Ok(frame) = encode_frame(
+                                        MessageType::Json, &payload, None, Flags::NONE, true,
+                                    ) {
+                                        let senders_read = senders_clone.read().await;
+                                        if let Some(tx) = senders_read.get(&peer_fp_clone) {
+                                            let _ = tx.send(frame);
+                                        }
+                                    }
+                                });
                             } else {
                                 dispatch_message(&peer_fp, mt, &full, &msg_tx);
                             }
@@ -539,7 +558,7 @@ async fn handle_connection(
             continue;
         }
 
-        // Intercept _wire_proxy_route requests (built-in protocol)
+        // Intercept built-in protocol messages
         if header.msg_type == MessageType::Json {
             if let Ok(data) = serde_json::from_slice::<Value>(&payload) {
                 if data.get("_wire_proxy_route").is_some() {
@@ -551,6 +570,31 @@ async fn handle_connection(
                         &senders,
                     )
                     .await;
+                    continue;
+                }
+                // Tunnel request from a SubController (we are the target)
+                if data.get("_wire_tunnel_req").is_some() {
+                    let senders_clone = senders.clone();
+                    let peer_fp_clone = peer_fp.clone();
+                    tokio::spawn(async move {
+                        let resp = tunnel::execute_tunnel_request(
+                            &data["_wire_tunnel_req"],
+                        )
+                        .await;
+                        let payload = serde_json::to_vec(&resp).unwrap_or_default();
+                        if let Ok(frame) = encode_frame(
+                            MessageType::Json,
+                            &payload,
+                            None,
+                            Flags::NONE,
+                            true,
+                        ) {
+                            let senders_read = senders_clone.read().await;
+                            if let Some(tx) = senders_read.get(&peer_fp_clone) {
+                                let _ = tx.send(frame);
+                            }
+                        }
+                    });
                     continue;
                 }
             }

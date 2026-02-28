@@ -32,6 +32,7 @@ from wire.protocol import (
     encode_relay_payload,
 )
 from wire.proxy import ReverseProxy
+from wire.tunnel import ProxyTunnel, handle_tunnel_request
 
 logger = logging.getLogger("wire.subcontroller")
 
@@ -69,6 +70,9 @@ class SubController:
 
         # Embedded reverse proxy
         self._proxy: ReverseProxy | None = None
+
+        # Active proxy tunnels
+        self._tunnels: list[ProxyTunnel] = []
 
     # -- public API ----------------------------------------------------------
 
@@ -161,7 +165,10 @@ class SubController:
         self._listen_task = asyncio.create_task(self._listen_loop())
 
     async def disconnect(self):
-        """Close the WebSocket connection and stop the embedded proxy."""
+        """Close the WebSocket connection, tunnels, and embedded proxy."""
+        for tunnel in self._tunnels:
+            await tunnel.stop()
+        self._tunnels.clear()
         if self._proxy:
             await self._proxy.stop()
             self._proxy = None
@@ -245,6 +252,77 @@ class SubController:
                 "path_prefix": path_prefix,
             }
         })
+
+    # -- proxy tunnels --------------------------------------------------------
+
+    async def open_proxy_tunnel(
+        self,
+        listen_host: str,
+        listen_port: int,
+        path_prefix: str,
+        target_fp: str,
+        upstream_url: str,
+        timeout: float = 30.0,
+    ) -> ProxyTunnel:
+        """Open an HTTP proxy tunnel through the Wire mesh.
+
+        Starts an HTTP server on this SubController at
+        ``listen_host:listen_port``.  Requests matching ``path_prefix``
+        are serialised, sent through the Wire mesh to the peer identified
+        by ``target_fp``, and that peer makes the actual HTTP request to
+        ``upstream_url``.
+
+        Args:
+            listen_host: Local bind address for the HTTP listener.
+            listen_port: Local port for the HTTP listener.
+            path_prefix: URL prefix to match, e.g. ``"/api"``.
+            target_fp: Fingerprint of the target peer that will make the
+                upstream HTTP call.  Can be another SubController's
+                fingerprint (routed via relay) or
+                ``self.controller_fingerprint`` (direct).
+            upstream_url: The upstream HTTP(S) service that the target
+                peer will call, e.g. ``"http://10.0.0.5:3000"``.
+            timeout: Per-request timeout in seconds.
+
+        Returns:
+            The ``ProxyTunnel`` object (call ``.stop()`` to close it).
+
+        Example::
+
+            tunnel = await sub.open_proxy_tunnel(
+                "0.0.0.0", 8080, "/api",
+                target_sub_fp,
+                "http://10.0.0.5:3000",
+            )
+            # curl http://localhost:8080/api/health
+            #   → Wire → target peer → http://10.0.0.5:3000/health
+        """
+        # Route through relay for other SubControllers, direct for Controller
+        if target_fp == self.controller_fingerprint:
+            async def _send_to_controller(_fp: str, data):
+                await self.send_json(data)
+            send_fn = _send_to_controller
+        else:
+            send_fn = self.send_json_to_peer
+
+        tunnel = ProxyTunnel(
+            send_fn=send_fn,
+            listen_host=listen_host,
+            listen_port=listen_port,
+            path_prefix=path_prefix,
+            target_fp=target_fp,
+            upstream_url=upstream_url,
+            timeout=timeout,
+        )
+        await tunnel.start()
+        self._tunnels.append(tunnel)
+        return tunnel
+
+    async def close_proxy_tunnel(self, tunnel: ProxyTunnel) -> None:
+        """Close a previously opened proxy tunnel."""
+        await tunnel.stop()
+        if tunnel in self._tunnels:
+            self._tunnels.remove(tunnel)
 
     # -- peer-to-peer via relay ----------------------------------------------
 
@@ -355,11 +433,27 @@ class SubController:
             await self._dispatch_relay(payload)
             return
 
-        # Intercept internal peer events before user handlers
+        # Intercept built-in protocol messages before user handlers
         if header.msg_type == MessageType.JSON:
             data = json.loads(payload)
             if "_wire_peer_event" in data:
                 self._handle_peer_event(data)
+                return
+            # Tunnel request from the Controller (we are the target)
+            if "_wire_tunnel_req" in data:
+                async def _respond_to_ctrl(_fp, d):
+                    await self.send_json(d)
+                asyncio.create_task(
+                    handle_tunnel_request(
+                        data["_wire_tunnel_req"], _respond_to_ctrl, ""
+                    )
+                )
+                return
+            # Tunnel response from the Controller (we are the initiator)
+            if "_wire_tunnel_res" in data:
+                for t in self._tunnels:
+                    if t.receive_response(data["_wire_tunnel_res"]):
+                        break
                 return
             handler = self._handlers.get(header.msg_type)
             if handler:
@@ -411,6 +505,29 @@ class SubController:
         """Decode a relay payload and dispatch to the relay handler."""
         source_fp, dest_fp, inner_type, inner_payload = decode_relay_payload(payload)
 
+        # Intercept tunnel messages (built-in protocol)
+        if inner_type == MessageType.JSON:
+            data = json.loads(inner_payload)
+            if "_wire_tunnel_req" in data:
+                asyncio.create_task(
+                    handle_tunnel_request(
+                        data["_wire_tunnel_req"],
+                        self.send_json_to_peer,
+                        source_fp,
+                    )
+                )
+                return
+            if "_wire_tunnel_res" in data:
+                for t in self._tunnels:
+                    if t.receive_response(data["_wire_tunnel_res"]):
+                        break
+                return
+            # Regular relay JSON — pass to user handler
+            handler = self._relay_handlers.get(inner_type)
+            if handler:
+                await handler(source_fp, data)
+            return
+
         handler = self._relay_handlers.get(inner_type)
         if handler is None:
             logger.debug("No relay handler for %s", inner_type)
@@ -419,9 +536,6 @@ class SubController:
         if inner_type in (MessageType.FILE, MessageType.IMAGE):
             filename, file_data = decode_file_payload(inner_payload)
             await handler(source_fp, filename, file_data)
-        elif inner_type == MessageType.JSON:
-            data = json.loads(inner_payload)
-            await handler(source_fp, data)
         elif inner_type == MessageType.BINARY:
             await handler(source_fp, inner_payload)
         else:

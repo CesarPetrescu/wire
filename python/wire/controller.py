@@ -34,6 +34,7 @@ from wire.protocol import (
     encode_relay_payload,
 )
 from wire.proxy import ReverseProxy
+from wire.tunnel import ProxyTunnel, handle_tunnel_request
 
 logger = logging.getLogger("wire.controller")
 
@@ -78,6 +79,9 @@ class Controller:
         # peer_fp -> list of path_prefixes
         self._peer_proxy_routes: dict[str, list[str]] = {}
 
+        # Active proxy tunnels
+        self._tunnels: list[ProxyTunnel] = []
+
     # -- public API ----------------------------------------------------------
 
     def on(self, msg_type: MessageType):
@@ -110,7 +114,10 @@ class Controller:
         logger.info("Controller listening on wss://%s:%d", self.host, self.port)
 
     async def stop(self):
-        """Shut down the server and embedded proxy (if running)."""
+        """Shut down the server, tunnels, and embedded proxy (if running)."""
+        for tunnel in self._tunnels:
+            await tunnel.stop()
+        self._tunnels.clear()
         if self._proxy:
             await self._proxy.stop()
             self._proxy = None
@@ -229,6 +236,47 @@ class Controller:
             return None
         return self._proxy.routes
 
+    # -- proxy tunnels --------------------------------------------------------
+
+    async def open_proxy_tunnel(
+        self,
+        listen_host: str,
+        listen_port: int,
+        path_prefix: str,
+        target_fp: str,
+        upstream_url: str,
+        timeout: float = 30.0,
+    ) -> ProxyTunnel:
+        """Open an HTTP proxy tunnel through the Wire mesh.
+
+        Starts an HTTP server on this Controller at
+        ``listen_host:listen_port``.  Requests matching ``path_prefix``
+        are forwarded through the Wire mesh to the SubController
+        identified by ``target_fp``, which makes the actual HTTP request
+        to ``upstream_url``.
+
+        Returns:
+            The ``ProxyTunnel`` object (call ``.stop()`` to close it).
+        """
+        tunnel = ProxyTunnel(
+            send_fn=self.send_json,
+            listen_host=listen_host,
+            listen_port=listen_port,
+            path_prefix=path_prefix,
+            target_fp=target_fp,
+            upstream_url=upstream_url,
+            timeout=timeout,
+        )
+        await tunnel.start()
+        self._tunnels.append(tunnel)
+        return tunnel
+
+    async def close_proxy_tunnel(self, tunnel: ProxyTunnel) -> None:
+        """Close a previously opened proxy tunnel."""
+        await tunnel.stop()
+        if tunnel in self._tunnels:
+            self._tunnels.remove(tunnel)
+
     # -- internal ------------------------------------------------------------
 
     async def _handle_connection(self, ws: websockets.asyncio.server.ServerConnection):
@@ -325,11 +373,25 @@ class Controller:
             await self._handle_relay(peer_fp, payload)
             return
 
-        # Non-streamed messages — intercept built-in proxy route requests
+        # Non-streamed messages — intercept built-in protocol messages
         if header.msg_type == MessageType.JSON:
             data = json.loads(payload)
             if "_wire_proxy_route" in data:
                 await self._handle_proxy_route_request(peer_fp, data["_wire_proxy_route"])
+                return
+            # Tunnel request from a SubController (we are the target)
+            if "_wire_tunnel_req" in data:
+                asyncio.create_task(
+                    handle_tunnel_request(
+                        data["_wire_tunnel_req"], self.send_json, peer_fp
+                    )
+                )
+                return
+            # Tunnel response from a SubController (we are the initiator)
+            if "_wire_tunnel_res" in data:
+                for t in self._tunnels:
+                    if t.receive_response(data["_wire_tunnel_res"]):
+                        break
                 return
             handler = self._handlers.get(header.msg_type)
             if handler:
