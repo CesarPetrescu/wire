@@ -7,7 +7,9 @@ import zlib
 import pytest
 
 from wire.protocol import (
+    CHECKSUM_SIZE,
     HEADER_SIZE,
+    ChecksumError,
     Flags,
     MessageType,
     decode_file_payload,
@@ -103,6 +105,37 @@ class TestFilePayload:
     def test_large_filename(self):
         filename = "a" * 1000 + ".bin"
         data = b"x"
+        encoded = encode_file_payload(filename, data)
+        dec_name, dec_data = decode_file_payload(encoded)
+        assert dec_name == filename
+        assert dec_data == data
+
+    def test_checksum_embedded_in_payload(self):
+        """Encoded payload should contain the SHA-256 checksum."""
+        import hashlib
+
+        filename = "test.zip"
+        data = b"\x50\x4b\x03\x04" + b"\x00" * 100
+        encoded = encode_file_payload(filename, data)
+        name_bytes = filename.encode("utf-8")
+        checksum_offset = 2 + len(name_bytes)
+        embedded = encoded[checksum_offset : checksum_offset + CHECKSUM_SIZE]
+        assert embedded == hashlib.sha256(data).digest()
+
+    def test_checksum_mismatch_raises(self):
+        """Corrupted file data should raise ChecksumError on decode."""
+        filename = "corrupted.zip"
+        data = b"original data content"
+        encoded = bytearray(encode_file_payload(filename, data))
+        # Corrupt a byte in the file data (after filename + checksum)
+        encoded[-1] ^= 0xFF
+        with pytest.raises(ChecksumError, match="checksum mismatch"):
+            decode_file_payload(bytes(encoded))
+
+    def test_checksum_valid_empty_data(self):
+        """Checksum should work correctly for empty file data."""
+        filename = "empty.bin"
+        data = b""
         encoded = encode_file_payload(filename, data)
         dec_name, dec_data = decode_file_payload(encoded)
         assert dec_name == filename

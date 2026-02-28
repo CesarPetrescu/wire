@@ -113,6 +113,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             data.len()
                         );
                     }
+                    wire_rs::subcontroller::WireMessage::RelayJson { source_fp, data } => {
+                        println!("[RELAY JSON from {}...]: {}", &source_fp[..16.min(source_fp.len())], data);
+                    }
+                    wire_rs::subcontroller::WireMessage::RelayBinary { source_fp, data } => {
+                        println!("[RELAY BINARY from {}...]: {} bytes", &source_fp[..16.min(source_fp.len())], data.len());
+                    }
+                    wire_rs::subcontroller::WireMessage::RelayFile { source_fp, filename, data } => {
+                        println!("[RELAY FILE from {}...]: {} ({} bytes)", &source_fp[..16.min(source_fp.len())], filename, data.len());
+                    }
+                    wire_rs::subcontroller::WireMessage::RelayImage { source_fp, filename, data } => {
+                        println!("[RELAY IMAGE from {}...]: {} ({} bytes)", &source_fp[..16.min(source_fp.len())], filename, data.len());
+                    }
+                    wire_rs::subcontroller::WireMessage::PeerJoined { peer_fp } => {
+                        println!("[PEER JOINED]: {}", peer_fp);
+                    }
+                    wire_rs::subcontroller::WireMessage::PeerLeft { peer_fp } => {
+                        println!("[PEER LEFT]: {}", peer_fp);
+                    }
                 }
             }
         }
