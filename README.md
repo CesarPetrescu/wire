@@ -1,102 +1,136 @@
-# Wire
+# Wire ⚡
 
-A bilingual (Python + Rust) framework for secure, high-performance WebSocket communication over a shared binary protocol.
+A modern **secure WebSocket framework** with matching **Python** and **Rust** implementations that speak the same binary protocol.
 
-Wire supports both:
+Wire is designed for private environments (LAN, edge, internal automation) where you need:
 
-- **Controller** (server) and **SubController** (client) roles
-- **JSON**, **binary**, **file**, and **image** message types
-- **TLS/mTLS-like trust** via certificate exchange + fingerprint pinning
-- **Streaming / chunked transfers** for large payloads
-- **Cross-language interoperability** (Python ↔ Rust)
+- ✅ **Controller + SubController topology**
+- ✅ **JSON + binary + file + image** message transport
+- ✅ **Streaming/chunked transfer** for large payloads
+- ✅ **Identity trust with certificate pinning**
+- ✅ **Python↔Rust interoperability** in production-like tests
 
----
-
-## What Wire is for
-
-Use Wire when you need private LAN / edge-style communication between one controller and many subcontrollers with strong peer identity checks and resumable large transfers.
+> `Wire` is the foundation for lightweight private channels where reliability and compatibility matter.
 
 ---
 
-## Security model (in short)
+## Why Wire? 🌐
 
-1. Each node generates an ECDSA P-256 self-signed certificate and key on startup.
-2. SubController connects with a `AUTH` frame containing:
-   - shared secret
-   - its certificate
-3. Controller validates the secret.
-4. Controller replies with `AUTH_OK` and its certificate on success.
-5. Both peers persist SHA-256 certificate fingerprints.
-6. On reconnection, a mismatched pinned fingerprint is rejected (man-in-the-middle / identity mismatch protection).
+When you have one orchestration service (Controller) and many workers (SubControllers), Wire gives you:
 
-No external CA is required.
+- **No external CA dependency** (self-signed cert flow)
+- **Shared-secret gatekeeping** at connect time
+- **Message-type consistency** across languages
+- **Simple extensibility** for new handlers and integrations
+
+Perfect for:
+- ✅ Home lab control planes
+- ✅ Internal tooling buses
+- ✅ Sensor/agent networks
+- ✅ Private file transfer bridges
 
 ---
 
-## Wire protocol (binary)
+## Protocol at a glance 🧬
 
-All frames use a **24-byte header** + payload.
+All frames use a fixed **24-byte header** + payload.
 
 | Offset | Size | Field |
 |---|---:|---|
 | 0 | 2 | Magic (`0xBE01`) |
 | 2 | 1 | Message type |
-| 3 | 16 | Message ID (UUID) |
+| 3 | 16 | Message ID (`UUID`) |
 | 19 | 1 | Flags |
 | 20 | 4 | Payload length |
-| 24 | ... | Payload |
+| 24 | ... | Payload bytes |
 
-### Message types
+### Message types 🔌
 
-| Code | Type | Meaning |
+| Hex | Type | Meaning |
 |---|---|---|
-| `0x01` | `JSON` | UTF-8 JSON payload |
-| `0x02` | `BINARY` | Arbitrary binary blob |
-| `0x03` | `FILE` | File transfer (name + bytes) |
-| `0x04` | `IMAGE` | Image transfer (name + bytes) |
-| `0x10` | `AUTH` | Auth handshake |
-| `0x11` | `AUTH_OK` | Handshake success |
-| `0x12` | `AUTH_FAIL` | Handshake failure |
+| `0x01` | `JSON` | JSON payload |
+| `0x02` | `BINARY` | Arbitrary binary |
+| `0x03` | `FILE` | Named file chunk |
+| `0x04` | `IMAGE` | Named image payload |
+| `0x10` | `AUTH` | Authentication handshake |
+| `0x11` | `AUTH_OK` | Handshake accepted |
+| `0x12` | `AUTH_FAIL` | Handshake rejected |
 | `0xFF` | `PING` | Keepalive |
 
-### Flags
+### Flags 🧭
 
 | Bit | Flag | Meaning |
 |---|---|---|
-| 0 | `STREAM_START` | first chunk of stream |
-| 1 | `STREAM_CHUNK` | intermediate chunk |
+| 0 | `STREAM_START` | first chunk |
+| 1 | `STREAM_CHUNK` | middle chunk |
 | 2 | `STREAM_END` | final chunk |
 | 3 | `COMPRESSED` | payload compressed |
 
-Large payloads are split into stream chunks; compression is applied when enabled.
+Large payloads are streamed automatically once above chunking threshold; checksums ensure integrity where applicable.
 
 ---
 
-## Repository layout
+## Security model 🛡️
+
+Wire uses a practical identity model:
+
+1. Node starts -> generates **ECDSA P-256** cert/key.
+2. SubController initiates with `AUTH` containing secret + certificate.
+3. Controller validates secret.
+4. On success, Controller sends `AUTH_OK` + its cert.
+5. Both peers store pinned SHA-256 fingerprints.
+6. On reconnect, peer mismatch triggers disconnect.
+
+This gives **identity continuity** without a CA dependency.
+
+---
+
+## Project structure 📁
 
 ```text
 wire/
   python/
-    wire/                  # Library implementation
-    tests/                 # Python tests
+    wire/
+      __init__.py
+      protocol.py
+      certs.py
+      controller.py
+      subcontroller.py
+    tests/
+      test_protocol.py
+      test_certs.py
+      test_integration.py
+      test_cross_language.py
+      test_star_topology.py
     requirements.txt
 
   rust/wire-rs/
-    src/                   # Library + CLI implementation
-    tests/                 # Rust tests
+    src/
+      lib.rs
+      protocol.rs
+      certs.rs
+      controller.rs
+      subcontroller.rs
+      main.rs
+    tests/
+      lib.rs
+      integration.rs
+      star_topology.rs
     Cargo.toml
 ```
 
 ---
 
-## Python implementation
+## Quick start 🚀
 
-### Requirements
+### 1) Clone + enter repo
 
-- Python 3.11+
-- `websockets`, `cryptography`
+```bash
+git clone git@github.com:CesarPetrescu/wire.git
+cd wire
+```
 
-### Setup
+### 2) Python setup (optional for mixed-language testing)
 
 ```bash
 cd python
@@ -105,20 +139,35 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Quick usage
+### 3) Rust setup
 
-#### Controller
+```bash
+cd rust/wire-rs
+cargo build --release
+```
+
+### 4) Run a tiny end-to-end check
+
+- Start controller (Python or Rust)
+- Start subcontroller (the other language)
+- Send JSON and verify response
+
+---
+
+## Python API usage 🐍
+
+### Controller
 
 ```python
 import asyncio
 from wire import Controller, MessageType
 
 async def main():
-    ctrl = Controller(host="0.0.0.0", port=8765, preshared_secret="my-secret-key")
+    ctrl = Controller(host="0.0.0.0", port=8765, preshared_secret="my-secret")
 
     @ctrl.on(MessageType.JSON)
     async def on_json(peer_fp, data):
-        print(f"Received JSON from {peer_fp[:16]}: {data}")
+        print(f"📩 JSON from {peer_fp[:16]}: {data}")
         await ctrl.send_json(peer_fp, {"status": "ok"})
 
     await ctrl.start()
@@ -130,90 +179,101 @@ async def main():
 asyncio.run(main())
 ```
 
-#### SubController
+### SubController
 
 ```python
 import asyncio
 from wire import SubController, MessageType
 
 async def main():
-    sub = SubController(controller_url="wss://192.168.1.100:8765", preshared_secret="my-secret-key")
+    sub = SubController(controller_url="wss://127.0.0.1:8765", preshared_secret="my-secret")
 
     @sub.on(MessageType.JSON)
     async def on_json(data):
-        print(f"Received from controller: {data}")
+        print(f"📤 From controller: {data}")
 
     await sub.connect()
-    await sub.send_json({"sensor": "temp", "value": 23.5})
-    await sub.send_binary(b"\x00\x01\x02\x03" * 1000)
+    await sub.send_json({"hello": "from python"})
+    await sub.send_binary(b"hello" * 100)
     await sub.disconnect()
 
 asyncio.run(main())
 ```
 
-## Rust implementation
+---
 
-### Requirements
+## Rust API / CLI usage 🦀
 
-- Rust (1.70+)
-
-### Build
+### Build release binary
 
 ```bash
 cd rust/wire-rs
 cargo build --release
 ```
 
-### CLI example
+### Run as CLI
 
 ```bash
-# Controller
 cargo run -- controller --host 0.0.0.0 --port 8765 --secret my-secret
-
-# SubController (in another terminal)
-cargo run -- sub --host 192.168.1.100 --port 8765 --secret my-secret
+cargo run -- sub --host 127.0.0.1 --port 8765 --secret my-secret
 ```
 
-Library examples are in the existing README content and source docs under `rust/wire-rs/src`.
+Library usage examples are available in source modules and existing docs/tests.
 
 ---
 
-## Tests and verification
+## Testing matrix 🧪
 
-Run all Python tests:
+### Python tests
 
 ```bash
-cd /root/clawd/python
-source .venv/bin/activate
+cd python
+source .venv/bin/activate   # if not already active
 python -m pytest tests/ -v
 ```
 
-Run Rust tests:
+### Rust tests
 
 ```bash
 cd rust/wire-rs
 cargo test -- --nocapture
 ```
 
-Run cross-language interoperability tests (requires Rust release binary built first):
+### Cross-language interoperability tests
 
 ```bash
+# build Rust binary first (required by tests)
 cd rust/wire-rs
 cargo build --release
+
 cd ../python
 source .venv/bin/activate
 python -m pytest tests/test_cross_language.py -v
 ```
 
-### Current status (this branch)
+### Current passing status ✅
 
-- Python test suite: **57 passed, 5 skipped**
-- Rust unit/integration/star-topology tests: **73 passed**
+- Python suite: **57 passed, 5 skipped**
+- Rust suites (`unit + integration + topology`): **73 passed**
 - Cross-language tests: **5 passed**
 
 ---
 
-## Interoperability
+## Contribution checklist 📋
 
-The Python and Rust stacks share the same binary protocol and message semantics.
-They can interoperate as Controller/SubController in mixed-language setups when the same shared secret and certificate policy are used.
+When changing protocol behavior:
+
+1. Update tests in both implementations where relevant.
+2. Run Python tests and Rust tests.
+3. Run cross-language tests.
+4. Keep behavior backward-compatible unless intentionally versioned.
+
+## License
+
+This project is provided as-is for internal/private use unless a LICENSE file is added explicitly.
+
+---
+
+## Interoperability claim 🤝
+
+Python and Rust now share the same wire-format and framing model, with successful inter-op validation across controller/subcontroller roles.
