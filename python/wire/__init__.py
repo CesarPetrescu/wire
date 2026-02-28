@@ -4,6 +4,7 @@ from wire.protocol import MessageType, FrameHeader, encode_frame, decode_frame, 
 from wire.certs import generate_self_signed_cert, get_cert_fingerprint
 from wire.controller import Controller
 from wire.subcontroller import SubController
+from wire.proxy import ReverseProxy
 
 __all__ = [
     "MessageType",
@@ -15,4 +16,5 @@ __all__ = [
     "get_cert_fingerprint",
     "Controller",
     "SubController",
+    "ReverseProxy",
 ]
