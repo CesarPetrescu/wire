@@ -89,6 +89,14 @@ This gives **identity continuity** without a CA dependency.
 
 ```text
 wire/
+  examples/
+    reverse-proxy/
+      basic_proxy.py / .rs
+      multi_service_proxy.py / .rs
+      dynamic_routes_proxy.py / .rs
+      versioned_api_proxy.py / .rs
+      wire_with_proxy.py          # combined controller + proxy
+
   python/
     wire/
       __init__.py
@@ -96,12 +104,14 @@ wire/
       certs.py
       controller.py
       subcontroller.py
+      proxy.py                    # ReverseProxy
     tests/
       test_protocol.py
       test_certs.py
       test_integration.py
       test_cross_language.py
       test_star_topology.py
+      test_proxy.py
     requirements.txt
 
   rust/wire-rs/
@@ -111,11 +121,13 @@ wire/
       certs.rs
       controller.rs
       subcontroller.rs
+      proxy.rs                    # ReverseProxy
       main.rs
     tests/
       lib.rs
       integration.rs
       star_topology.rs
+      proxy.rs
     Cargo.toml
 ```
 
@@ -256,6 +268,73 @@ python -m pytest tests/test_cross_language.py -v
 - Python suite: **57 passed, 5 skipped**
 - Rust suites (`unit + integration + topology`): **73 passed**
 - Cross-language tests: **5 passed**
+
+---
+
+## Reverse proxy 🔀
+
+Wire includes a built-in **HTTP reverse proxy** (in both Python and Rust) that maps URL path prefixes to upstream HTTP services. It is useful for exposing multiple Docker containers or HTTP backends through a single entry point.
+
+### Key features
+
+- **Longest-prefix matching** — `/api/v2` is matched before `/api`
+- **Prefix stripping** — `/api/users` with prefix `/api` is forwarded as `/users`
+- **X-Forwarded-\* headers** — `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto`
+- **Hop-by-hop header filtering** — connection-specific headers are stripped
+- **Streaming response bodies** — large payloads are streamed efficiently
+- **Dynamic route management** — add or remove routes at runtime
+
+### Python quick start
+
+```python
+import asyncio
+from wire import ReverseProxy
+
+async def main():
+    proxy = ReverseProxy(host="0.0.0.0", port=8080)
+    proxy.add_route("/api", "http://backend:3000")
+    proxy.add_route("/dashboard", "http://frontend:8081")
+    await proxy.start()
+
+    try:
+        await asyncio.Future()  # run forever
+    except KeyboardInterrupt:
+        await proxy.stop()
+
+asyncio.run(main())
+```
+
+### Rust quick start
+
+```rust
+use wire_rs::proxy::ReverseProxy;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut proxy = ReverseProxy::new("0.0.0.0", 8080);
+    proxy.add_route("/api", "http://backend:3000").await;
+    proxy.add_route("/dashboard", "http://frontend:8081").await;
+    proxy.start().await?;
+
+    tokio::signal::ctrl_c().await?;
+    proxy.stop().await;
+    Ok(())
+}
+```
+
+### Use cases and examples
+
+Runnable examples live in `examples/reverse-proxy/`:
+
+| Example | Description |
+|---|---|
+| `basic_proxy` | Single-backend pass-through proxy |
+| `multi_service_proxy` | Route multiple services by path prefix |
+| `dynamic_routes_proxy` | Add and remove routes while the proxy is running |
+| `versioned_api_proxy` | Route `/api/v1` and `/api/v2` to different backends |
+| `wire_with_proxy` | Run a Wire WebSocket controller alongside the HTTP proxy (Python) |
+
+Each example is available in both **Python** (`.py`) and **Rust** (`.rs`).
 
 ---
 
