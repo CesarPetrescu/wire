@@ -231,12 +231,10 @@ class ReverseProxy:
             timeout=self.read_timeout,
         )
 
-        resp_header_dict = {k: v for k, v in resp_headers}
-        return web.Response(
-            status=status,
-            headers=resp_header_dict,
-            body=resp_body,
-        )
+        response = web.Response(status=status, body=resp_body)
+        for k, v in resp_headers:
+            response.headers.add(k, v)
+        return response
 
     @staticmethod
     def _forward_request_headers(request: web.Request) -> dict[str, str]:

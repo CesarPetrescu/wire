@@ -11,8 +11,10 @@
 
 use serde_json::json;
 use std::env;
+use url::Url;
 use wire_rs::config;
 use wire_rs::controller::Controller;
+use wire_rs::proxy::ReverseProxy;
 use wire_rs::subcontroller::{ServiceDef, SubController};
 
 #[tokio::main]
@@ -86,6 +88,19 @@ async fn cmd_start(args: &[String]) -> Result<(), Box<dyn std::error::Error + Se
                 cfg.listen.host, cfg.listen.port
             );
 
+            // Start reverse proxy if configured
+            if cfg.proxy.enabled {
+                let mut proxy = ReverseProxy::new(&cfg.proxy.host, cfg.proxy.port);
+                for route in &cfg.proxy.static_routes {
+                    proxy.add_route(&route.prefix, &route.upstream).await;
+                }
+                proxy.start().await?;
+                println!(
+                    "ReverseProxy running on http://{}:{}.",
+                    cfg.proxy.host, cfg.proxy.port
+                );
+            }
+
             // Wait for Ctrl+C
             tokio::select! {
                 _ = async {
@@ -100,12 +115,15 @@ async fn cmd_start(args: &[String]) -> Result<(), Box<dyn std::error::Error + Se
             }
         }
         "sub" => {
-            let mut sub = SubController::new(
-                &cfg.controller.url.replace("wss://", "").split(':').next().unwrap_or("127.0.0.1"),
-                cfg.controller.url.replace("wss://", "").split(':').last()
-                    .and_then(|s| s.parse().ok()).unwrap_or(8765),
-                &secret,
-            );
+            // Parse controller URL using the url crate
+            let parsed_url = Url::parse(&cfg.controller.url).unwrap_or_else(|_| {
+                // Fallback: try adding a scheme so the url crate can parse it
+                Url::parse(&format!("wss://{}", cfg.controller.url))
+                    .unwrap_or_else(|_| Url::parse("wss://127.0.0.1:8765").unwrap())
+            });
+            let ctrl_host = parsed_url.host_str().unwrap_or("127.0.0.1").to_string();
+            let ctrl_port = parsed_url.port().unwrap_or(8765);
+            let mut sub = SubController::new(&ctrl_host, ctrl_port, &secret);
 
             // Set services
             if !cfg.services.is_empty() {

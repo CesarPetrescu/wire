@@ -4,7 +4,6 @@
  *
  * Usage:
  *   wire-node sub --host 127.0.0.1 --port 8765 --secret mysecret
- *   wire-node start -c wire.yaml
  */
 
 import { SubController, ServiceDef } from "./subcontroller";

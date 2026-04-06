@@ -252,25 +252,48 @@ export function encodeHttpRequest(
   return Buffer.concat(parts);
 }
 
+function needBytes(payload: Buffer, offset: number, n: number, field: string): void {
+  if (payload.length - offset < n) {
+    throw new Error(`Truncated HTTP payload: need ${n} bytes for ${field}, have ${payload.length - offset}`);
+  }
+}
+
 export function decodeHttpRequest(
   payload: Buffer,
 ): [HttpMethod, string, string, [string, string][], Buffer] {
   let offset = 0;
+
+  needBytes(payload, offset, 1, "method");
   const method = payload.readUInt8(offset) as HttpMethod; offset += 1;
+
+  needBytes(payload, offset, 2, "path length");
   const pathLen = payload.readUInt16BE(offset); offset += 2;
+  needBytes(payload, offset, pathLen, "path");
   const path = payload.subarray(offset, offset + pathLen).toString("utf-8"); offset += pathLen;
+
+  needBytes(payload, offset, 2, "query length");
   const queryLen = payload.readUInt16BE(offset); offset += 2;
+  needBytes(payload, offset, queryLen, "query");
   const query = payload.subarray(offset, offset + queryLen).toString("utf-8"); offset += queryLen;
+
+  needBytes(payload, offset, 2, "header count");
   const headerCount = payload.readUInt16BE(offset); offset += 2;
   const headers: [string, string][] = [];
   for (let i = 0; i < headerCount; i++) {
+    needBytes(payload, offset, 2, `header ${i} key length`);
     const kl = payload.readUInt16BE(offset); offset += 2;
+    needBytes(payload, offset, kl, `header ${i} key`);
     const key = payload.subarray(offset, offset + kl).toString("utf-8"); offset += kl;
+    needBytes(payload, offset, 2, `header ${i} value length`);
     const vl = payload.readUInt16BE(offset); offset += 2;
+    needBytes(payload, offset, vl, `header ${i} value`);
     const val = payload.subarray(offset, offset + vl).toString("utf-8"); offset += vl;
     headers.push([key, val]);
   }
+
+  needBytes(payload, offset, 4, "body length");
   const bodyLen = payload.readUInt32BE(offset); offset += 4;
+  needBytes(payload, offset, bodyLen, "body");
   const body = Buffer.from(payload.subarray(offset, offset + bodyLen));
   return [method, path, query, headers, body];
 }
@@ -309,17 +332,27 @@ export function decodeHttpResponse(
   payload: Buffer,
 ): [number, [string, string][], Buffer] {
   let offset = 0;
+
+  needBytes(payload, offset, 2, "status code");
   const statusCode = payload.readUInt16BE(offset); offset += 2;
+
+  needBytes(payload, offset, 2, "header count");
   const headerCount = payload.readUInt16BE(offset); offset += 2;
   const headers: [string, string][] = [];
   for (let i = 0; i < headerCount; i++) {
+    needBytes(payload, offset, 2, `header ${i} key length`);
     const kl = payload.readUInt16BE(offset); offset += 2;
+    needBytes(payload, offset, kl, `header ${i} key`);
     const key = payload.subarray(offset, offset + kl).toString("utf-8"); offset += kl;
+    needBytes(payload, offset, 2, `header ${i} value length`);
     const vl = payload.readUInt16BE(offset); offset += 2;
+    needBytes(payload, offset, vl, `header ${i} value`);
     const val = payload.subarray(offset, offset + vl).toString("utf-8"); offset += vl;
     headers.push([key, val]);
   }
+  needBytes(payload, offset, 4, "body length");
   const bodyLen = payload.readUInt32BE(offset); offset += 4;
+  needBytes(payload, offset, bodyLen, "body");
   const body = Buffer.from(payload.subarray(offset, offset + bodyLen));
   return [statusCode, headers, body];
 }

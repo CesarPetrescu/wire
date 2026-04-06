@@ -458,7 +458,16 @@ class SubController:
 
     async def _handle_http_request(self, msg_id: bytes, payload: bytes):
         """Handle an HTTP_REQUEST from the controller: forward to local upstream."""
-        method, path, query, headers, body = decode_http_request(payload)
+        try:
+            method, path, query, headers, body = decode_http_request(payload)
+        except Exception as exc:
+            logger.error("Failed to decode HTTP_REQUEST payload: %s", exc)
+            resp_payload = encode_http_response(400, [], b"Bad Request")
+            frame = encode_frame(
+                MessageType.HTTP_RESPONSE, resp_payload, msg_id=msg_id, compress=True
+            )
+            await self._ws.send(frame)
+            return
 
         upstream, remainder = self._match_service(path)
         if upstream is None:

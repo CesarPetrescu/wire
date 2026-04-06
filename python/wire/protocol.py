@@ -256,31 +256,53 @@ def decode_http_request(
 ) -> tuple[HttpMethod, str, str, list[tuple[str, str]], bytes]:
     """Decode an HTTP request payload. Returns (method, path, query, headers, body)."""
     offset = 0
+
+    def _need(n: int, field: str) -> None:
+        nonlocal offset
+        if len(payload) - offset < n:
+            raise ValueError(f"Truncated HTTP request payload: need {n} bytes for {field}, have {len(payload) - offset}")
+
+    _need(1, "method")
     method = HttpMethod(payload[offset])
     offset += 1
+
+    _need(2, "path length")
     path_len = struct.unpack("!H", payload[offset : offset + 2])[0]
     offset += 2
+    _need(path_len, "path")
     path = payload[offset : offset + path_len].decode("utf-8")
     offset += path_len
+
+    _need(2, "query length")
     query_len = struct.unpack("!H", payload[offset : offset + 2])[0]
     offset += 2
+    _need(query_len, "query")
     query = payload[offset : offset + query_len].decode("utf-8")
     offset += query_len
+
+    _need(2, "header count")
     header_count = struct.unpack("!H", payload[offset : offset + 2])[0]
     offset += 2
     headers: list[tuple[str, str]] = []
-    for _ in range(header_count):
+    for i in range(header_count):
+        _need(2, f"header {i} key length")
         kl = struct.unpack("!H", payload[offset : offset + 2])[0]
         offset += 2
+        _need(kl, f"header {i} key")
         key = payload[offset : offset + kl].decode("utf-8")
         offset += kl
+        _need(2, f"header {i} value length")
         vl = struct.unpack("!H", payload[offset : offset + 2])[0]
         offset += 2
+        _need(vl, f"header {i} value")
         val = payload[offset : offset + vl].decode("utf-8")
         offset += vl
         headers.append((key, val))
+
+    _need(4, "body length")
     body_len = struct.unpack("!I", payload[offset : offset + 4])[0]
     offset += 4
+    _need(body_len, "body")
     body = payload[offset : offset + body_len]
     return method, path, query, headers, body
 
@@ -318,22 +340,38 @@ def decode_http_response(
 ) -> tuple[int, list[tuple[str, str]], bytes]:
     """Decode an HTTP response payload. Returns (status_code, headers, body)."""
     offset = 0
+
+    def _need(n: int, field: str) -> None:
+        nonlocal offset
+        if len(payload) - offset < n:
+            raise ValueError(f"Truncated HTTP response payload: need {n} bytes for {field}, have {len(payload) - offset}")
+
+    _need(2, "status code")
     status_code = struct.unpack("!H", payload[offset : offset + 2])[0]
     offset += 2
+
+    _need(2, "header count")
     header_count = struct.unpack("!H", payload[offset : offset + 2])[0]
     offset += 2
     headers: list[tuple[str, str]] = []
-    for _ in range(header_count):
+    for i in range(header_count):
+        _need(2, f"header {i} key length")
         kl = struct.unpack("!H", payload[offset : offset + 2])[0]
         offset += 2
+        _need(kl, f"header {i} key")
         key = payload[offset : offset + kl].decode("utf-8")
         offset += kl
+        _need(2, f"header {i} value length")
         vl = struct.unpack("!H", payload[offset : offset + 2])[0]
         offset += 2
+        _need(vl, f"header {i} value")
         val = payload[offset : offset + vl].decode("utf-8")
         offset += vl
         headers.append((key, val))
+
+    _need(4, "body length")
     body_len = struct.unpack("!I", payload[offset : offset + 4])[0]
     offset += 4
+    _need(body_len, "body")
     body = payload[offset : offset + body_len]
     return status_code, headers, body

@@ -82,8 +82,9 @@ class Controller:
         self._unhealthy_threshold: int = 3
         self._healthy_threshold: int = 1
         self._health_check_task: asyncio.Task | None = None
-        # Track consecutive health check results: prefix -> consecutive_fails
-        self._health_check_state: dict[str, int] = {}
+        # Track consecutive health check results
+        self._health_check_fails: dict[str, int] = {}
+        self._health_check_successes: dict[str, int] = {}
 
         # Proxy integration
         self._proxy = proxy
@@ -170,13 +171,17 @@ class Controller:
                             [], b"", timeout=self._health_check_timeout,
                         )
                         if 200 <= status < 400:
-                            # Healthy
-                            fails = self._health_check_state.get(prefix, 0)
-                            if fails > 0:
-                                self._health_check_state[prefix] = 0
+                            # Successful probe
+                            self._health_check_fails[prefix] = 0
                             if not route["healthy"]:
-                                route["healthy"] = True
-                                logger.info("Route %s is healthy again", prefix)
+                                successes = self._health_check_successes.get(prefix, 0) + 1
+                                self._health_check_successes[prefix] = successes
+                                if successes >= self._healthy_threshold:
+                                    route["healthy"] = True
+                                    self._health_check_successes[prefix] = 0
+                                    logger.info("Route %s is healthy again", prefix)
+                            else:
+                                self._health_check_successes[prefix] = 0
                         else:
                             self._record_health_failure(prefix, route)
                     except Exception:
@@ -185,8 +190,9 @@ class Controller:
             pass
 
     def _record_health_failure(self, prefix: str, route: dict) -> None:
-        fails = self._health_check_state.get(prefix, 0) + 1
-        self._health_check_state[prefix] = fails
+        self._health_check_successes[prefix] = 0
+        fails = self._health_check_fails.get(prefix, 0) + 1
+        self._health_check_fails[prefix] = fails
         if fails >= self._unhealthy_threshold and route["healthy"]:
             route["healthy"] = False
             logger.warning(

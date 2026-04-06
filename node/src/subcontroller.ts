@@ -271,7 +271,9 @@ export class SubController extends EventEmitter {
 
     // HTTP_REQUEST from controller
     if (header.msgType === MessageType.HTTP_REQUEST) {
-      this._handleHttpRequest(header.msgId, payload);
+      void this._handleHttpRequest(header.msgId, payload).catch((err) => {
+        this.emit("error", err);
+      });
       return;
     }
 

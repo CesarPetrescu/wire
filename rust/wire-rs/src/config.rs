@@ -232,38 +232,42 @@ pub fn parse_duration_secs(s: &str) -> Result<f64, String> {
 }
 
 /// Expand `${VAR}` in a string using environment variables.
-fn expand_env(s: &str) -> String {
+/// Returns an error if any referenced variable is not set.
+fn expand_env(s: &str) -> Result<String, String> {
     let mut result = s.to_string();
     // Simple regex-free approach
     loop {
         if let Some(start) = result.find("${") {
             if let Some(end) = result[start..].find('}') {
                 let var_name = &result[start + 2..start + end];
-                let val = std::env::var(var_name).unwrap_or_default();
+                let val = std::env::var(var_name).map_err(|_| {
+                    format!("environment variable '{}' is not set", var_name)
+                })?;
                 result = format!("{}{}{}", &result[..start], val, &result[start + end + 1..]);
                 continue;
             }
         }
         break;
     }
-    result
+    Ok(result)
 }
 
 /// Recursively expand env vars in a serde_yaml::Value.
-fn expand_env_value(v: serde_yaml::Value) -> serde_yaml::Value {
+fn expand_env_value(v: serde_yaml::Value) -> Result<serde_yaml::Value, String> {
     match v {
-        serde_yaml::Value::String(s) => serde_yaml::Value::String(expand_env(&s)),
+        serde_yaml::Value::String(s) => Ok(serde_yaml::Value::String(expand_env(&s)?)),
         serde_yaml::Value::Mapping(m) => {
             let mut new_map = serde_yaml::Mapping::new();
             for (k, val) in m {
-                new_map.insert(k, expand_env_value(val));
+                new_map.insert(k, expand_env_value(val)?);
             }
-            serde_yaml::Value::Mapping(new_map)
+            Ok(serde_yaml::Value::Mapping(new_map))
         }
         serde_yaml::Value::Sequence(seq) => {
-            serde_yaml::Value::Sequence(seq.into_iter().map(expand_env_value).collect())
+            let expanded: Result<Vec<_>, _> = seq.into_iter().map(expand_env_value).collect();
+            Ok(serde_yaml::Value::Sequence(expanded?))
         }
-        other => other,
+        other => Ok(other),
     }
 }
 
@@ -271,7 +275,7 @@ fn expand_env_value(v: serde_yaml::Value) -> serde_yaml::Value {
 pub fn load_config(path: &str) -> Result<WireConfig, Box<dyn std::error::Error + Send + Sync>> {
     let contents = fs::read_to_string(path)?;
     let raw: serde_yaml::Value = serde_yaml::from_str(&contents)?;
-    let expanded = expand_env_value(raw);
+    let expanded = expand_env_value(raw).map_err(|e| e)?;
     let cfg: WireConfig = serde_yaml::from_value(expanded)?;
     Ok(cfg)
 }
@@ -318,10 +322,12 @@ mod tests {
     #[test]
     fn test_expand_env() {
         std::env::set_var("WIRE_TEST_VAR", "hello");
-        assert_eq!(expand_env("${WIRE_TEST_VAR}"), "hello");
-        assert_eq!(expand_env("prefix_${WIRE_TEST_VAR}_suffix"), "prefix_hello_suffix");
-        assert_eq!(expand_env("no_vars_here"), "no_vars_here");
+        assert_eq!(expand_env("${WIRE_TEST_VAR}").unwrap(), "hello");
+        assert_eq!(expand_env("prefix_${WIRE_TEST_VAR}_suffix").unwrap(), "prefix_hello_suffix");
+        assert_eq!(expand_env("no_vars_here").unwrap(), "no_vars_here");
         std::env::remove_var("WIRE_TEST_VAR");
+        // Missing var should return an error
+        assert!(expand_env("${WIRE_TEST_VAR}").is_err());
     }
 
     #[test]

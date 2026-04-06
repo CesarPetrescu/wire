@@ -11,7 +11,9 @@ Restart=always
 RestartSec=5
 User=wire
 Group=wire
-Environment=WIRE_SECRET=
+# Load secrets from a protected file rather than inlining them here.
+# Example: EnvironmentFile=/etc/wire/wire.env
+# The env file should contain: WIRE_SECRET=your-secret-here
 
 [Install]
 WantedBy=multi-user.target

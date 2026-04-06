@@ -154,9 +154,17 @@ export class ReverseProxy {
         this.readTimeout * 1000,
       );
 
-      const headerObj: Record<string, string> = {};
-      for (const [k, v] of respHeaders) headerObj[k] = v;
-      res.writeHead(status, headerObj);
+      // Preserve duplicate headers (e.g. Set-Cookie)
+      const headerMap: Record<string, string | string[]> = {};
+      for (const [k, v] of respHeaders) {
+        if (k in headerMap) {
+          const existing = headerMap[k];
+          headerMap[k] = Array.isArray(existing) ? [...existing, v] : [existing, v];
+        } else {
+          headerMap[k] = v;
+        }
+      }
+      res.writeHead(status, headerMap);
       res.end(respBody);
       return;
     }

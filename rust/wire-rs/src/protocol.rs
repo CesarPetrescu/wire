@@ -82,6 +82,10 @@ pub enum ProtocolError {
     BadMagic(u16),
     #[error("Bad message type: 0x{0:02X}")]
     BadMessageType(u8),
+    #[error("Bad HTTP method: {0}")]
+    BadHttpMethod(String),
+    #[error("Invalid HTTP payload: {0}")]
+    InvalidHttpPayload(String),
     #[error("Payload truncated: got {got}, expected {expected}")]
     PayloadTruncated { got: usize, expected: usize },
     #[error("Decompression error: {0}")]
@@ -276,7 +280,7 @@ impl TryFrom<u8> for HttpMethod {
             4 => Ok(Self::Patch),
             5 => Ok(Self::Head),
             6 => Ok(Self::Options),
-            _ => Err(ProtocolError::BadMessageType(v)),
+            _ => Err(ProtocolError::BadHttpMethod(format!("0x{:02X}", v))),
         }
     }
 }
@@ -291,7 +295,7 @@ impl HttpMethod {
             "PATCH" => Ok(Self::Patch),
             "HEAD" => Ok(Self::Head),
             "OPTIONS" => Ok(Self::Options),
-            _ => Err(ProtocolError::BadMessageType(0xFF)),
+            other => Err(ProtocolError::BadHttpMethod(other.to_string())),
         }
     }
 
@@ -344,39 +348,62 @@ pub fn encode_http_request(
 pub fn decode_http_request(
     payload: &[u8],
 ) -> Result<(HttpMethod, String, String, Vec<(String, String)>, Vec<u8>), ProtocolError> {
+    /// Read exactly N bytes from `payload` starting at `offset`, or return an error.
+    macro_rules! read_bytes {
+        ($offset:expr, $n:expr) => {{
+            let start = $offset;
+            let end = start + $n;
+            payload.get(start..end).ok_or_else(|| {
+                ProtocolError::InvalidHttpPayload(format!(
+                    "truncated: need bytes {}..{} but payload is {} bytes",
+                    start,
+                    end,
+                    payload.len()
+                ))
+            })?
+        }};
+    }
+
     let mut offset = 0;
-    let method = HttpMethod::try_from(payload[offset])?;
+
+    // method byte
+    let method_byte = *read_bytes!(offset, 1).first().unwrap();
     offset += 1;
-    let path_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    let method = HttpMethod::try_from(method_byte)?;
+
+    // path
+    let path_len = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
     offset += 2;
-    let path = String::from_utf8_lossy(&payload[offset..offset + path_len]).to_string();
+    let path = String::from_utf8_lossy(read_bytes!(offset, path_len)).to_string();
     offset += path_len;
-    let query_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+
+    // query
+    let query_len = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
     offset += 2;
-    let query = String::from_utf8_lossy(&payload[offset..offset + query_len]).to_string();
+    let query = String::from_utf8_lossy(read_bytes!(offset, query_len)).to_string();
     offset += query_len;
-    let header_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+
+    // headers
+    let header_count = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
     offset += 2;
     let mut headers = Vec::with_capacity(header_count);
     for _ in 0..header_count {
-        let kl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        let kl = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
         offset += 2;
-        let key = String::from_utf8_lossy(&payload[offset..offset + kl]).to_string();
+        let key = String::from_utf8_lossy(read_bytes!(offset, kl)).to_string();
         offset += kl;
-        let vl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        let vl = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
         offset += 2;
-        let val = String::from_utf8_lossy(&payload[offset..offset + vl]).to_string();
+        let val = String::from_utf8_lossy(read_bytes!(offset, vl)).to_string();
         offset += vl;
         headers.push((key, val));
     }
-    let body_len = u32::from_be_bytes([
-        payload[offset],
-        payload[offset + 1],
-        payload[offset + 2],
-        payload[offset + 3],
-    ]) as usize;
+
+    // body
+    let body_len = u32::from_be_bytes(read_bytes!(offset, 4).try_into().unwrap()) as usize;
     offset += 4;
-    let body = payload[offset..offset + body_len].to_vec();
+    let body = read_bytes!(offset, body_len).to_vec();
+
     Ok((method, path, query, headers, body))
 }
 
@@ -406,31 +433,49 @@ pub fn encode_http_response(
 pub fn decode_http_response(
     payload: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), ProtocolError> {
+    /// Read exactly N bytes from `payload` starting at `offset`, or return an error.
+    macro_rules! read_bytes {
+        ($offset:expr, $n:expr) => {{
+            let start = $offset;
+            let end = start + $n;
+            payload.get(start..end).ok_or_else(|| {
+                ProtocolError::InvalidHttpPayload(format!(
+                    "truncated: need bytes {}..{} but payload is {} bytes",
+                    start,
+                    end,
+                    payload.len()
+                ))
+            })?
+        }};
+    }
+
     let mut offset = 0;
-    let status_code = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+
+    // status code
+    let status_code = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap());
     offset += 2;
-    let header_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+
+    // headers
+    let header_count = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
     offset += 2;
     let mut headers = Vec::with_capacity(header_count);
     for _ in 0..header_count {
-        let kl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        let kl = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
         offset += 2;
-        let key = String::from_utf8_lossy(&payload[offset..offset + kl]).to_string();
+        let key = String::from_utf8_lossy(read_bytes!(offset, kl)).to_string();
         offset += kl;
-        let vl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        let vl = u16::from_be_bytes(read_bytes!(offset, 2).try_into().unwrap()) as usize;
         offset += 2;
-        let val = String::from_utf8_lossy(&payload[offset..offset + vl]).to_string();
+        let val = String::from_utf8_lossy(read_bytes!(offset, vl)).to_string();
         offset += vl;
         headers.push((key, val));
     }
-    let body_len = u32::from_be_bytes([
-        payload[offset],
-        payload[offset + 1],
-        payload[offset + 2],
-        payload[offset + 3],
-    ]) as usize;
+
+    // body
+    let body_len = u32::from_be_bytes(read_bytes!(offset, 4).try_into().unwrap()) as usize;
     offset += 4;
-    let body = payload[offset..offset + body_len].to_vec();
+    let body = read_bytes!(offset, body_len).to_vec();
+
     Ok((status_code, headers, body))
 }
 
