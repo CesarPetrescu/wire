@@ -189,3 +189,45 @@ describe("HttpMethod helpers", () => {
     assert.equal(httpMethodToStr(HttpMethod.POST), "POST");
   });
 });
+
+describe("File payload — extended", () => {
+  it("Unicode filename", () => {
+    const data = Buffer.from("unicode data");
+    const encoded = encodeFilePayload("日本語ファイル.txt", data);
+    const [name, decoded] = decodeFilePayload(encoded);
+    assert.equal(name, "日本語ファイル.txt");
+    assert.deepEqual(decoded, data);
+  });
+
+  it("Large filename (200 chars)", () => {
+    const longName = "a".repeat(200) + ".bin";
+    const data = Buffer.from("data");
+    const encoded = encodeFilePayload(longName, data);
+    const [name, decoded] = decodeFilePayload(encoded);
+    assert.equal(name, longName);
+    assert.deepEqual(decoded, data);
+  });
+
+  it("Checksum is embedded in payload", () => {
+    const data = Buffer.from("test data for checksum");
+    const encoded = encodeFilePayload("check.bin", data);
+    const nameLen = encoded.readUInt16BE(0);
+    const checksumStart = 2 + nameLen;
+    const checksum = encoded.subarray(checksumStart, checksumStart + 32);
+    assert.equal(checksum.length, 32);
+    // Verify it's a valid SHA-256
+    const crypto = require("crypto");
+    const expected = crypto.createHash("sha256").update(data).digest();
+    assert.deepEqual(checksum, expected);
+  });
+});
+
+describe("Frame — truncated payload", () => {
+  it("Payload truncated raises", () => {
+    const payload = Buffer.from("hello world");
+    const frame = encodeFrame(MessageType.JSON, payload);
+    // Chop off some of the payload
+    const truncated = frame.subarray(0, frame.length - 5);
+    assert.throws(() => decodeFrame(truncated), /Payload truncated/);
+  });
+});

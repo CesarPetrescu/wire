@@ -33,3 +33,34 @@ export {
   SubControllerOptions,
   ServiceDef,
 } from "./subcontroller";
+
+export {
+  Controller,
+  TunnelRoute,
+  MessageHandler,
+} from "./controller";
+
+export {
+  ReverseProxy,
+  TunnelFn,
+  TunnelRouteInfo,
+} from "./proxy";
+
+export {
+  WireConfig,
+  NodeConfig,
+  ListenConfig,
+  AuthConfig,
+  ProxyConfig,
+  ServiceConfig,
+  ControllerConnectConfig,
+  ReconnectConfig,
+  LogConfig,
+  HealthCheckConfig,
+  StaticRoute,
+  parseDuration,
+  expandEnv,
+  resolvedSecret,
+  loadConfig,
+  validateConfig,
+} from "./config";
