@@ -23,12 +23,15 @@ from wire.certs import CertBundle, create_ssl_context_client, generate_self_sign
 from wire.protocol import (
     STREAM_CHUNK_SIZE,
     Flags,
+    HttpMethod,
     MessageType,
     decode_file_payload,
     decode_frame,
+    decode_http_request,
     decode_relay_payload,
     encode_file_payload,
     encode_frame,
+    encode_http_response,
     encode_relay_payload,
 )
 
@@ -45,11 +48,16 @@ class SubController:
         controller_url: str = "wss://localhost:8765",
         preshared_secret: str = "",
         cert_dir: str | None = None,
+        services: list[dict] | None = None,
     ):
         self.controller_url = controller_url
         self.preshared_secret = preshared_secret
         self.cert_dir = cert_dir
         self.cert_bundle: CertBundle | None = None
+
+        # Services to advertise to the controller for HTTP tunneling
+        # Each dict: {"prefix": "/api", "upstream": "http://localhost:3000", "health_check": "/health"}
+        self.services: list[dict] = services or []
 
         # The controller's pinned fingerprint (set after first auth)
         self.controller_fingerprint: str | None = None
@@ -65,6 +73,15 @@ class SubController:
 
         # Known peers (other SubControllers connected to the same Controller)
         self._known_peers: set[str] = set()
+
+        # HTTP client session for forwarding tunneled requests
+        self._http_session: Any = None
+
+        # Reconnection settings
+        self._reconnect_enabled: bool = False
+        self._reconnect_initial_delay: float = 1.0
+        self._reconnect_max_delay: float = 30.0
+        self._reconnect_max_attempts: int = 0  # 0 = infinite
 
     # -- public API ----------------------------------------------------------
 
@@ -114,6 +131,14 @@ class SubController:
         await self._authenticate()
         logger.info("Connected and authenticated to controller.")
 
+        # Create HTTP session for forwarding tunneled requests
+        if self.services:
+            from aiohttp import ClientSession, ClientTimeout, TCPConnector
+            self._http_session = ClientSession(
+                connector=TCPConnector(limit=100),
+                timeout=ClientTimeout(total=30),
+            )
+
         # Start background listener
         self._listen_task = asyncio.create_task(self._listen_loop())
 
@@ -125,6 +150,9 @@ class SubController:
                 await self._listen_task
             except asyncio.CancelledError:
                 pass
+        if self._http_session:
+            await self._http_session.close()
+            self._http_session = None
         if self._ws:
             await self._ws.close()
             logger.info("Disconnected from controller.")
@@ -182,17 +210,33 @@ class SubController:
 
     # -- internal ------------------------------------------------------------
 
+    def configure_reconnect(
+        self,
+        enabled: bool = True,
+        initial_delay: float = 1.0,
+        max_delay: float = 30.0,
+        max_attempts: int = 0,
+    ) -> None:
+        """Configure automatic reconnection with exponential backoff."""
+        self._reconnect_enabled = enabled
+        self._reconnect_initial_delay = initial_delay
+        self._reconnect_max_delay = max_delay
+        self._reconnect_max_attempts = max_attempts
+
     def _ensure_connected(self):
         if self._ws is None:
             raise RuntimeError("Not connected. Call connect() first.")
 
     async def _authenticate(self):
-        """Send pre-shared secret + our cert, receive controller's cert."""
-        auth_payload = json.dumps({
+        """Send pre-shared secret + our cert + services, receive controller's cert."""
+        auth_data: dict[str, Any] = {
             "secret": self.preshared_secret,
             "cert_pem": self.cert_bundle.cert_pem.decode("utf-8"),
             "fingerprint": self.cert_bundle.fingerprint,
-        }).encode("utf-8")
+        }
+        if self.services:
+            auth_data["services"] = self.services
+        auth_payload = json.dumps(auth_data).encode("utf-8")
 
         frame = encode_frame(MessageType.AUTH, auth_payload)
         await self._ws.send(frame)
@@ -241,6 +285,8 @@ class SubController:
                     logger.error("Error dispatching message: %s", e)
         except websockets.exceptions.ConnectionClosed:
             logger.info("Connection to controller closed.")
+            if self._reconnect_enabled:
+                await self._reconnect_loop()
         except asyncio.CancelledError:
             pass
 
@@ -251,6 +297,11 @@ class SubController:
         # Stream reassembly
         if header.flags & (Flags.STREAM_START | Flags.STREAM_CHUNK | Flags.STREAM_END):
             await self._handle_stream_chunk(header, payload)
+            return
+
+        # HTTP tunnel requests from the controller
+        if header.msg_type == MessageType.HTTP_REQUEST:
+            await self._handle_http_request(header.msg_id, payload)
             return
 
         # Relay messages from another SubController
@@ -340,6 +391,117 @@ class SubController:
         elif event == "left":
             self._known_peers.discard(peer_fp)
             logger.info("Peer left: %s", peer_fp[:16] + "...")
+
+    async def _reconnect_loop(self):
+        """Attempt to reconnect with exponential backoff."""
+        delay = self._reconnect_initial_delay
+        attempts = 0
+        while True:
+            if self._reconnect_max_attempts > 0 and attempts >= self._reconnect_max_attempts:
+                logger.warning("Max reconnection attempts (%d) reached", self._reconnect_max_attempts)
+                break
+            attempts += 1
+            logger.info("Reconnecting in %.1fs (attempt %d)...", delay, attempts)
+            await asyncio.sleep(delay)
+            try:
+                ssl_ctx = create_ssl_context_client(self.cert_bundle)
+                self._ws = await websockets.asyncio.client.connect(
+                    self.controller_url,
+                    ssl=ssl_ctx,
+                    max_size=None,
+                )
+                await self._authenticate()
+                logger.info("Reconnected successfully.")
+                # Re-create HTTP session if needed
+                if self.services and self._http_session is None:
+                    from aiohttp import ClientSession, ClientTimeout, TCPConnector
+                    self._http_session = ClientSession(
+                        connector=TCPConnector(limit=100),
+                        timeout=ClientTimeout(total=30),
+                    )
+                # Restart listen loop (non-recursive, just re-enters the read loop)
+                try:
+                    async for raw in self._ws:
+                        if isinstance(raw, str):
+                            raw = raw.encode("utf-8")
+                        try:
+                            await self._dispatch(raw)
+                        except Exception as e:
+                            logger.error("Error dispatching message: %s", e)
+                except websockets.exceptions.ConnectionClosed:
+                    logger.info("Connection lost again.")
+                    delay = self._reconnect_initial_delay
+                    continue
+            except Exception as exc:
+                logger.warning("Reconnection failed: %s", exc)
+                delay = min(delay * 2, self._reconnect_max_delay)
+
+    def _match_service(self, path: str) -> tuple[str | None, str | None]:
+        """Find the longest matching service prefix. Returns (upstream, remainder)."""
+        best_prefix: str | None = None
+        for svc in self.services:
+            prefix = "/" + svc["prefix"].strip("/")
+            if path == prefix or path.startswith(prefix + "/") or prefix == "/":
+                if best_prefix is None or len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+        if best_prefix is None:
+            return None, None
+        upstream = None
+        for svc in self.services:
+            if "/" + svc["prefix"].strip("/") == best_prefix:
+                upstream = svc["upstream"].rstrip("/")
+                break
+        remainder = path[len(best_prefix):] if best_prefix != "/" else path
+        if not remainder.startswith("/"):
+            remainder = "/" + remainder
+        return upstream, remainder
+
+    async def _handle_http_request(self, msg_id: bytes, payload: bytes):
+        """Handle an HTTP_REQUEST from the controller: forward to local upstream."""
+        method, path, query, headers, body = decode_http_request(payload)
+
+        upstream, remainder = self._match_service(path)
+        if upstream is None:
+            resp_payload = encode_http_response(404, [], b"No matching service")
+            frame = encode_frame(
+                MessageType.HTTP_RESPONSE, resp_payload, msg_id=msg_id
+            )
+            await self._ws.send(frame)
+            return
+
+        target_url = upstream + remainder
+        if query:
+            target_url += "?" + query
+
+        req_headers = {k: v for k, v in headers}
+
+        try:
+            async with self._http_session.request(
+                method=method.to_str(),
+                url=target_url,
+                headers=req_headers,
+                data=body if body else None,
+                allow_redirects=False,
+            ) as resp:
+                resp_body = await resp.read()
+                resp_headers = [
+                    (k, v) for k, v in resp.headers.items()
+                    if k.lower() not in {
+                        "connection", "keep-alive", "transfer-encoding",
+                        "te", "trailers", "upgrade",
+                    }
+                ]
+                resp_payload = encode_http_response(
+                    resp.status, resp_headers, resp_body
+                )
+        except Exception as exc:
+            logger.error("Local upstream error for %s: %s", target_url, exc)
+            resp_payload = encode_http_response(502, [], b"Bad Gateway")
+
+        frame = encode_frame(
+            MessageType.HTTP_RESPONSE, resp_payload, msg_id=msg_id, compress=True
+        )
+        await self._ws.send(frame)
 
     async def _send_payload_streamed(
         self, ws, msg_type: MessageType, payload: bytes

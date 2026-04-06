@@ -27,6 +27,8 @@ pub enum MessageType {
     File = 0x03,
     Image = 0x04,
     Relay = 0x05,
+    HttpRequest = 0x06,
+    HttpResponse = 0x07,
     Auth = 0x10,
     AuthOk = 0x11,
     AuthFail = 0x12,
@@ -42,6 +44,8 @@ impl TryFrom<u8> for MessageType {
             0x03 => Ok(Self::File),
             0x04 => Ok(Self::Image),
             0x05 => Ok(Self::Relay),
+            0x06 => Ok(Self::HttpRequest),
+            0x07 => Ok(Self::HttpResponse),
             0x10 => Ok(Self::Auth),
             0x11 => Ok(Self::AuthOk),
             0x12 => Ok(Self::AuthFail),
@@ -245,6 +249,189 @@ pub fn decode_relay_payload(
     offset += 1;
     let inner_payload = payload[offset..].to_vec();
     Ok((source_fp, dest_fp, inner_msg_type, inner_payload))
+}
+
+// ── HTTP method enum ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HttpMethod {
+    Get = 0,
+    Post = 1,
+    Put = 2,
+    Delete = 3,
+    Patch = 4,
+    Head = 5,
+    Options = 6,
+}
+
+impl TryFrom<u8> for HttpMethod {
+    type Error = ProtocolError;
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        match v {
+            0 => Ok(Self::Get),
+            1 => Ok(Self::Post),
+            2 => Ok(Self::Put),
+            3 => Ok(Self::Delete),
+            4 => Ok(Self::Patch),
+            5 => Ok(Self::Head),
+            6 => Ok(Self::Options),
+            _ => Err(ProtocolError::BadMessageType(v)),
+        }
+    }
+}
+
+impl HttpMethod {
+    pub fn from_str(s: &str) -> Result<Self, ProtocolError> {
+        match s.to_uppercase().as_str() {
+            "GET" => Ok(Self::Get),
+            "POST" => Ok(Self::Post),
+            "PUT" => Ok(Self::Put),
+            "DELETE" => Ok(Self::Delete),
+            "PATCH" => Ok(Self::Patch),
+            "HEAD" => Ok(Self::Head),
+            "OPTIONS" => Ok(Self::Options),
+            _ => Err(ProtocolError::BadMessageType(0xFF)),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Patch => "PATCH",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+        }
+    }
+}
+
+// ── HTTP tunnel payloads ─────────────────────────────────────────────────────
+
+/// Encode an HTTP request for tunneling through WebSocket.
+pub fn encode_http_request(
+    method: HttpMethod,
+    path: &str,
+    query: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let path_b = path.as_bytes();
+    let query_b = query.as_bytes();
+    let mut buf = Vec::new();
+    buf.push(method as u8);
+    buf.extend_from_slice(&(path_b.len() as u16).to_be_bytes());
+    buf.extend_from_slice(path_b);
+    buf.extend_from_slice(&(query_b.len() as u16).to_be_bytes());
+    buf.extend_from_slice(query_b);
+    buf.extend_from_slice(&(headers.len() as u16).to_be_bytes());
+    for (key, val) in headers {
+        let kb = key.as_bytes();
+        let vb = val.as_bytes();
+        buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+        buf.extend_from_slice(kb);
+        buf.extend_from_slice(&(vb.len() as u16).to_be_bytes());
+        buf.extend_from_slice(vb);
+    }
+    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Decode an HTTP request payload. Returns (method, path, query, headers, body).
+pub fn decode_http_request(
+    payload: &[u8],
+) -> Result<(HttpMethod, String, String, Vec<(String, String)>, Vec<u8>), ProtocolError> {
+    let mut offset = 0;
+    let method = HttpMethod::try_from(payload[offset])?;
+    offset += 1;
+    let path_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let path = String::from_utf8_lossy(&payload[offset..offset + path_len]).to_string();
+    offset += path_len;
+    let query_len = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let query = String::from_utf8_lossy(&payload[offset..offset + query_len]).to_string();
+    offset += query_len;
+    let header_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        let kl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        let key = String::from_utf8_lossy(&payload[offset..offset + kl]).to_string();
+        offset += kl;
+        let vl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        let val = String::from_utf8_lossy(&payload[offset..offset + vl]).to_string();
+        offset += vl;
+        headers.push((key, val));
+    }
+    let body_len = u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]) as usize;
+    offset += 4;
+    let body = payload[offset..offset + body_len].to_vec();
+    Ok((method, path, query, headers, body))
+}
+
+/// Encode an HTTP response for tunneling through WebSocket.
+pub fn encode_http_response(
+    status_code: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&status_code.to_be_bytes());
+    buf.extend_from_slice(&(headers.len() as u16).to_be_bytes());
+    for (key, val) in headers {
+        let kb = key.as_bytes();
+        let vb = val.as_bytes();
+        buf.extend_from_slice(&(kb.len() as u16).to_be_bytes());
+        buf.extend_from_slice(kb);
+        buf.extend_from_slice(&(vb.len() as u16).to_be_bytes());
+        buf.extend_from_slice(vb);
+    }
+    buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Decode an HTTP response payload. Returns (status_code, headers, body).
+pub fn decode_http_response(
+    payload: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), ProtocolError> {
+    let mut offset = 0;
+    let status_code = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+    offset += 2;
+    let header_count = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+    offset += 2;
+    let mut headers = Vec::with_capacity(header_count);
+    for _ in 0..header_count {
+        let kl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        let key = String::from_utf8_lossy(&payload[offset..offset + kl]).to_string();
+        offset += kl;
+        let vl = u16::from_be_bytes([payload[offset], payload[offset + 1]]) as usize;
+        offset += 2;
+        let val = String::from_utf8_lossy(&payload[offset..offset + vl]).to_string();
+        offset += vl;
+        headers.push((key, val));
+    }
+    let body_len = u32::from_be_bytes([
+        payload[offset],
+        payload[offset + 1],
+        payload[offset + 2],
+        payload[offset + 3],
+    ]) as usize;
+    offset += 4;
+    let body = payload[offset..offset + body_len].to_vec();
+    Ok((status_code, headers, body))
 }
 
 #[cfg(test)]

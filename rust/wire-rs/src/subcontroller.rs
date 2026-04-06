@@ -28,6 +28,15 @@ pub enum WireMessage {
     PeerLeft { peer_fp: String },
 }
 
+/// A service advertised by this SubController for HTTP tunneling.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ServiceDef {
+    pub prefix: String,
+    pub upstream: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<String>,
+}
+
 pub struct SubController {
     controller_host: String,
     controller_port: u16,
@@ -39,6 +48,7 @@ pub struct SubController {
     message_tx: mpsc::UnboundedSender<WireMessage>,
     listen_handle: Option<tokio::task::JoinHandle<()>>,
     known_peers: Arc<RwLock<HashSet<String>>>,
+    services: Vec<ServiceDef>,
 }
 
 impl SubController {
@@ -55,7 +65,12 @@ impl SubController {
             message_tx,
             listen_handle: None,
             known_peers: Arc::new(RwLock::new(HashSet::new())),
+            services: Vec::new(),
         }
+    }
+
+    pub fn set_services(&mut self, services: Vec<ServiceDef>) {
+        self.services = services;
     }
 
     pub fn fingerprint(&self) -> Option<String> {
@@ -101,11 +116,14 @@ impl SubController {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         // Auth handshake
-        let auth_data = serde_json::json!({
+        let mut auth_data = serde_json::json!({
             "secret": self.preshared_secret,
             "cert_pem": bundle.cert_pem,
             "fingerprint": bundle.fingerprint,
         });
+        if !self.services.is_empty() {
+            auth_data["services"] = serde_json::to_value(&self.services)?;
+        }
         let auth_frame = encode_frame(
             MessageType::Auth,
             serde_json::to_vec(&auth_data)?.as_slice(),
@@ -184,6 +202,8 @@ impl SubController {
         // Spawn reader
         let msg_tx = self.message_tx.clone();
         let known_peers = self.known_peers.clone();
+        let services = self.services.clone();
+        let sender_for_reader = self.sender.clone();
         let listen_handle = tokio::spawn(async move {
             let stream_buffers: HashMap<[u8; 16], Vec<Vec<u8>>> = HashMap::new();
             let stream_meta: HashMap<[u8; 16], MessageType> = HashMap::new();
@@ -244,6 +264,17 @@ impl SubController {
                             }
                         }
                     }
+                    continue;
+                }
+
+                // HTTP tunnel requests from the controller
+                if header.msg_type == MessageType::HttpRequest {
+                    let services = services.clone();
+                    let sender = sender_for_reader.clone();
+                    let msg_id = header.msg_id;
+                    tokio::spawn(async move {
+                        handle_http_request(msg_id, &payload, &services, &sender).await;
+                    });
                     continue;
                 }
 
@@ -501,4 +532,136 @@ async fn dispatch_sub_message(
         _ => return,
     };
     let _ = msg_tx.send(wire_msg);
+}
+
+/// Handle an HTTP_REQUEST by forwarding to the local upstream service.
+async fn handle_http_request(
+    msg_id: [u8; 16],
+    payload: &[u8],
+    services: &[ServiceDef],
+    sender: &Arc<RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+) {
+    let (method, path, query, headers, body) = match decode_http_request(payload) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("HTTP request decode error: {}", e);
+            return;
+        }
+    };
+
+    // Find matching service (longest prefix)
+    let mut best: Option<&ServiceDef> = None;
+    for svc in services {
+        let prefix = format!("/{}", svc.prefix.trim_matches('/'));
+        let matches = if prefix == "/" {
+            true
+        } else {
+            path == prefix || path.starts_with(&format!("{}/", prefix))
+        };
+        if matches {
+            if best.is_none() || svc.prefix.len() > best.unwrap().prefix.len() {
+                best = Some(svc);
+            }
+        }
+    }
+
+    let resp_payload = if let Some(svc) = best {
+        let prefix = format!("/{}", svc.prefix.trim_matches('/'));
+        let remainder = if prefix == "/" {
+            path.clone()
+        } else {
+            let r = &path[prefix.len()..];
+            if r.is_empty() || !r.starts_with('/') {
+                format!("/{}", r.trim_start_matches('/'))
+            } else {
+                r.to_string()
+            }
+        };
+        let upstream = svc.upstream.trim_end_matches('/');
+        let target_url = if query.is_empty() {
+            format!("{}{}", upstream, remainder)
+        } else {
+            format!("{}{}?{}", upstream, remainder, query)
+        };
+
+        match forward_to_upstream(method, &target_url, &headers, &body).await {
+            Ok((status, resp_headers, resp_body)) => {
+                let hdr_refs: Vec<(&str, &str)> = resp_headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str()))
+                    .collect();
+                encode_http_response(status, &hdr_refs, &resp_body)
+            }
+            Err(e) => {
+                warn!("Local upstream error for {}: {}", target_url, e);
+                encode_http_response(502, &[], b"Bad Gateway")
+            }
+        }
+    } else {
+        encode_http_response(404, &[], b"No matching service")
+    };
+
+    let frame = match encode_frame(
+        MessageType::HttpResponse,
+        &resp_payload,
+        Some(msg_id),
+        Flags::NONE,
+        true,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to encode HTTP response: {}", e);
+            return;
+        }
+    };
+
+    let sender_guard = sender.read().await;
+    if let Some(tx) = sender_guard.as_ref() {
+        let _ = tx.send(frame);
+    }
+}
+
+async fn forward_to_upstream(
+    method: HttpMethod,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()?;
+
+    let mut req = client.request(
+        reqwest::Method::from_bytes(method.as_str().as_bytes())?,
+        url,
+    );
+
+    for (key, val) in headers {
+        let lower = key.to_lowercase();
+        if lower != "host"
+            && lower != "connection"
+            && lower != "transfer-encoding"
+            && lower != "keep-alive"
+        {
+            req = req.header(key.as_str(), val.as_str());
+        }
+    }
+
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    let resp = req.send().await?;
+    let status = resp.status().as_u16();
+    let resp_headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(k, _)| {
+            let s = k.as_str().to_lowercase();
+            s != "transfer-encoding" && s != "connection"
+        })
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+    let resp_body = resp.bytes().await?.to_vec();
+    Ok((status, resp_headers, resp_body))
 }

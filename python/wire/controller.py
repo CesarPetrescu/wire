@@ -25,12 +25,16 @@ from wire.protocol import (
     HEADER_SIZE,
     STREAM_CHUNK_SIZE,
     Flags,
+    HttpMethod,
     MessageType,
     decode_file_payload,
     decode_frame,
+    decode_http_request,
+    decode_http_response,
     decode_relay_payload,
     encode_file_payload,
     encode_frame,
+    encode_http_request,
     encode_relay_payload,
 )
 
@@ -49,6 +53,7 @@ class Controller:
         port: int = 8765,
         preshared_secret: str = "",
         cert_dir: str | None = None,
+        proxy: "Optional[Any]" = None,
     ):
         self.host = host
         self.port = port
@@ -70,6 +75,22 @@ class Controller:
 
         self._server: Any = None
         self._serve_task: asyncio.Task | None = None
+
+        # Health check config
+        self._health_check_interval: float = 10.0
+        self._health_check_timeout: float = 5.0
+        self._unhealthy_threshold: int = 3
+        self._healthy_threshold: int = 1
+        self._health_check_task: asyncio.Task | None = None
+        # Track consecutive health check results: prefix -> consecutive_fails
+        self._health_check_state: dict[str, int] = {}
+
+        # Proxy integration
+        self._proxy = proxy
+        # Tunnel route table: prefix -> {"upstream", "peer_fp", "health_check", "healthy"}
+        self._tunnel_routes: dict[str, dict] = {}
+        # Pending HTTP tunnel requests: msg_id -> asyncio.Future
+        self._pending_requests: dict[bytes, asyncio.Future] = {}
 
     # -- public API ----------------------------------------------------------
 
@@ -104,10 +125,73 @@ class Controller:
 
     async def stop(self):
         """Shut down the server."""
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
         if self._server:
             self._server.close()
             await self._server.wait_closed()
             logger.info("Controller stopped.")
+
+    def configure_health_check(
+        self,
+        interval: float = 10.0,
+        timeout: float = 5.0,
+        unhealthy_threshold: int = 3,
+        healthy_threshold: int = 1,
+    ) -> None:
+        """Configure health checking parameters."""
+        self._health_check_interval = interval
+        self._health_check_timeout = timeout
+        self._unhealthy_threshold = unhealthy_threshold
+        self._healthy_threshold = healthy_threshold
+
+    def start_health_checks(self) -> None:
+        """Start the background health check loop."""
+        if self._health_check_task is None:
+            self._health_check_task = asyncio.create_task(self._health_check_loop())
+
+    async def _health_check_loop(self):
+        """Periodically check health of tunnel routes."""
+        try:
+            while True:
+                await asyncio.sleep(self._health_check_interval)
+                for prefix, route in list(self._tunnel_routes.items()):
+                    hc_path = route.get("health_check")
+                    if not hc_path:
+                        continue
+                    peer_fp = route["peer_fp"]
+                    try:
+                        status, _, _ = await self.tunnel_request(
+                            peer_fp, "GET", hc_path, "",
+                            [], b"", timeout=self._health_check_timeout,
+                        )
+                        if 200 <= status < 400:
+                            # Healthy
+                            fails = self._health_check_state.get(prefix, 0)
+                            if fails > 0:
+                                self._health_check_state[prefix] = 0
+                            if not route["healthy"]:
+                                route["healthy"] = True
+                                logger.info("Route %s is healthy again", prefix)
+                        else:
+                            self._record_health_failure(prefix, route)
+                    except Exception:
+                        self._record_health_failure(prefix, route)
+        except asyncio.CancelledError:
+            pass
+
+    def _record_health_failure(self, prefix: str, route: dict) -> None:
+        fails = self._health_check_state.get(prefix, 0) + 1
+        self._health_check_state[prefix] = fails
+        if fails >= self._unhealthy_threshold and route["healthy"]:
+            route["healthy"] = False
+            logger.warning(
+                "Route %s marked unhealthy after %d failures", prefix, fails
+            )
 
     async def send_json(self, peer_fp: str, data: Any):
         """Send a JSON message to a connected peer."""
@@ -148,6 +232,83 @@ class Controller:
     def peer_fingerprints(self) -> list[str]:
         return list(self._peers.keys())
 
+    @property
+    def tunnel_routes(self) -> dict[str, dict]:
+        """Return a copy of the tunnel route table."""
+        return dict(self._tunnel_routes)
+
+    def register_peer_routes(self, peer_fp: str, services: list[dict]) -> None:
+        """Register tunnel routes from a peer's advertised services."""
+        for svc in services:
+            prefix = "/" + svc["prefix"].strip("/")
+            route = {
+                "upstream": svc["upstream"],
+                "peer_fp": peer_fp,
+                "health_check": svc.get("health_check"),
+                "healthy": True,
+            }
+            self._tunnel_routes[prefix] = route
+            logger.info(
+                "Tunnel route registered: %s -> peer %s (upstream %s)",
+                prefix, peer_fp[:16] + "...", svc["upstream"],
+            )
+            # Register with proxy if attached
+            if self._proxy is not None:
+                self._proxy.add_tunnel_route(prefix, peer_fp, self.tunnel_request)
+
+    def deregister_peer_routes(self, peer_fp: str) -> None:
+        """Remove all tunnel routes owned by a peer."""
+        to_remove = [
+            prefix for prefix, route in self._tunnel_routes.items()
+            if route["peer_fp"] == peer_fp
+        ]
+        for prefix in to_remove:
+            del self._tunnel_routes[prefix]
+            logger.info("Tunnel route removed: %s", prefix)
+            if self._proxy is not None:
+                self._proxy.remove_route(prefix)
+
+    async def tunnel_request(
+        self,
+        peer_fp: str,
+        method: str,
+        path: str,
+        query: str,
+        headers: list[tuple[str, str]],
+        body: bytes,
+        timeout: float = 30.0,
+    ) -> tuple[int, list[tuple[str, str]], bytes]:
+        """Send an HTTP request through the WebSocket tunnel to a peer.
+
+        Returns (status_code, response_headers, response_body).
+        """
+        ws = self._peers.get(peer_fp)
+        if not ws:
+            return 502, [], b"Peer not connected"
+
+        http_method = HttpMethod.from_str(method)
+        req_payload = encode_http_request(http_method, path, query, headers, body)
+        msg_id = uuid.uuid4().bytes
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future = loop.create_future()
+        self._pending_requests[msg_id] = future
+
+        try:
+            frame = encode_frame(
+                MessageType.HTTP_REQUEST, req_payload, msg_id=msg_id, compress=True
+            )
+            await ws.send(frame)
+            resp_payload = await asyncio.wait_for(future, timeout=timeout)
+            return decode_http_response(resp_payload)
+        except asyncio.TimeoutError:
+            return 504, [], b"Gateway Timeout"
+        except Exception as exc:
+            logger.error("Tunnel request error: %s", exc)
+            return 502, [], b"Bad Gateway"
+        finally:
+            self._pending_requests.pop(msg_id, None)
+
     # -- internal ------------------------------------------------------------
 
     async def _handle_connection(self, ws: websockets.asyncio.server.ServerConnection):
@@ -180,6 +341,7 @@ class Controller:
         finally:
             if peer_fp and peer_fp in self._peers:
                 del self._peers[peer_fp]
+                self.deregister_peer_routes(peer_fp)
                 await self._notify_peer_left(peer_fp)
 
     async def _authenticate(self, ws) -> str | None:
@@ -228,6 +390,12 @@ class Controller:
         }).encode("utf-8")
         ok_frame = encode_frame(MessageType.AUTH_OK, ok_payload)
         await ws.send(ok_frame)
+
+        # Register tunnel routes if the peer advertised services
+        peer_services = auth_data.get("services", [])
+        if peer_services:
+            self.register_peer_routes(peer_fp, peer_services)
+
         return peer_fp
 
     async def _dispatch(self, peer_fp: str, raw: bytes):
@@ -237,6 +405,13 @@ class Controller:
         # Handle streaming reassembly
         if header.flags & (Flags.STREAM_START | Flags.STREAM_CHUNK | Flags.STREAM_END):
             await self._handle_stream_chunk(peer_fp, header, payload)
+            return
+
+        # HTTP_RESPONSE — resolve the pending tunnel request Future
+        if header.msg_type == MessageType.HTTP_RESPONSE:
+            future = self._pending_requests.get(header.msg_id)
+            if future and not future.done():
+                future.set_result(payload)
             return
 
         # Relay messages — forward to destination peer

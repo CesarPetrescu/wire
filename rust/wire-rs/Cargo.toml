@@ -27,6 +27,9 @@ http = "1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "client-legacy", "server-auto"] }
 http-body-util = "0.1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
