@@ -1,0 +1,19 @@
+[Unit]
+Description=Wire mesh daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wire start -c /etc/wire/wire.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+User=wire
+Group=wire
+# Load secrets from a protected file rather than inlining them here.
+# Example: EnvironmentFile=/etc/wire/wire.env
+# The env file should contain: WIRE_SECRET=your-secret-here
+
+[Install]
+WantedBy=multi-user.target

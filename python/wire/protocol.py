@@ -22,6 +22,8 @@ Message types:
   0x05  RELAY       - peer-to-peer relay via Controller
                       (2-byte src_fp len + src_fp + 2-byte dst_fp len + dst_fp
                        + 1-byte inner msg type + inner payload)
+  0x06  HTTP_REQUEST  - HTTP request tunneled through WebSocket
+  0x07  HTTP_RESPONSE - HTTP response tunneled through WebSocket
   0x10  AUTH        - authentication handshake
   0x11  AUTH_OK     - auth accepted
   0x12  AUTH_FAIL   - auth rejected
@@ -48,6 +50,8 @@ class MessageType(enum.IntEnum):
     FILE = 0x03
     IMAGE = 0x04
     RELAY = 0x05
+    HTTP_REQUEST = 0x06
+    HTTP_RESPONSE = 0x07
     AUTH = 0x10
     AUTH_OK = 0x11
     AUTH_FAIL = 0x12
@@ -188,3 +192,186 @@ def decode_relay_payload(
     offset += 1
     inner_payload = payload[offset:]
     return source_fp, dest_fp, inner_msg_type, inner_payload
+
+
+# ── HTTP method enum ─────────────────────────────────────────────────────────
+
+class HttpMethod(enum.IntEnum):
+    GET = 0
+    POST = 1
+    PUT = 2
+    DELETE = 3
+    PATCH = 4
+    HEAD = 5
+    OPTIONS = 6
+
+    @classmethod
+    def from_str(cls, method: str) -> "HttpMethod":
+        return cls[method.upper()]
+
+    def to_str(self) -> str:
+        return self.name
+
+
+# ── HTTP tunnel payloads ─────────────────────────────────────────────────────
+
+def encode_http_request(
+    method: HttpMethod,
+    path: str,
+    query: str,
+    headers: list[tuple[str, str]],
+    body: bytes,
+) -> bytes:
+    """Encode an HTTP request for tunneling through WebSocket.
+
+    Format:
+      [1-byte method][2-byte path len][path][2-byte query len][query]
+      [2-byte header count]([2-byte key len][key][2-byte val len][val])*
+      [4-byte body len][body]
+    """
+    path_b = path.encode("utf-8")
+    query_b = query.encode("utf-8")
+    parts = [
+        struct.pack("!B", int(method)),
+        struct.pack("!H", len(path_b)),
+        path_b,
+        struct.pack("!H", len(query_b)),
+        query_b,
+        struct.pack("!H", len(headers)),
+    ]
+    for key, val in headers:
+        kb = key.encode("utf-8")
+        vb = val.encode("utf-8")
+        parts.append(struct.pack("!H", len(kb)))
+        parts.append(kb)
+        parts.append(struct.pack("!H", len(vb)))
+        parts.append(vb)
+    parts.append(struct.pack("!I", len(body)))
+    parts.append(body)
+    return b"".join(parts)
+
+
+def decode_http_request(
+    payload: bytes,
+) -> tuple[HttpMethod, str, str, list[tuple[str, str]], bytes]:
+    """Decode an HTTP request payload. Returns (method, path, query, headers, body)."""
+    offset = 0
+
+    def _need(n: int, field: str) -> None:
+        nonlocal offset
+        if len(payload) - offset < n:
+            raise ValueError(f"Truncated HTTP request payload: need {n} bytes for {field}, have {len(payload) - offset}")
+
+    _need(1, "method")
+    method = HttpMethod(payload[offset])
+    offset += 1
+
+    _need(2, "path length")
+    path_len = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    _need(path_len, "path")
+    path = payload[offset : offset + path_len].decode("utf-8")
+    offset += path_len
+
+    _need(2, "query length")
+    query_len = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    _need(query_len, "query")
+    query = payload[offset : offset + query_len].decode("utf-8")
+    offset += query_len
+
+    _need(2, "header count")
+    header_count = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    headers: list[tuple[str, str]] = []
+    for i in range(header_count):
+        _need(2, f"header {i} key length")
+        kl = struct.unpack("!H", payload[offset : offset + 2])[0]
+        offset += 2
+        _need(kl, f"header {i} key")
+        key = payload[offset : offset + kl].decode("utf-8")
+        offset += kl
+        _need(2, f"header {i} value length")
+        vl = struct.unpack("!H", payload[offset : offset + 2])[0]
+        offset += 2
+        _need(vl, f"header {i} value")
+        val = payload[offset : offset + vl].decode("utf-8")
+        offset += vl
+        headers.append((key, val))
+
+    _need(4, "body length")
+    body_len = struct.unpack("!I", payload[offset : offset + 4])[0]
+    offset += 4
+    _need(body_len, "body")
+    body = payload[offset : offset + body_len]
+    return method, path, query, headers, body
+
+
+def encode_http_response(
+    status_code: int,
+    headers: list[tuple[str, str]],
+    body: bytes,
+) -> bytes:
+    """Encode an HTTP response for tunneling through WebSocket.
+
+    Format:
+      [2-byte status][2-byte header count]
+      ([2-byte key len][key][2-byte val len][val])*
+      [4-byte body len][body]
+    """
+    parts = [
+        struct.pack("!H", status_code),
+        struct.pack("!H", len(headers)),
+    ]
+    for key, val in headers:
+        kb = key.encode("utf-8")
+        vb = val.encode("utf-8")
+        parts.append(struct.pack("!H", len(kb)))
+        parts.append(kb)
+        parts.append(struct.pack("!H", len(vb)))
+        parts.append(vb)
+    parts.append(struct.pack("!I", len(body)))
+    parts.append(body)
+    return b"".join(parts)
+
+
+def decode_http_response(
+    payload: bytes,
+) -> tuple[int, list[tuple[str, str]], bytes]:
+    """Decode an HTTP response payload. Returns (status_code, headers, body)."""
+    offset = 0
+
+    def _need(n: int, field: str) -> None:
+        nonlocal offset
+        if len(payload) - offset < n:
+            raise ValueError(f"Truncated HTTP response payload: need {n} bytes for {field}, have {len(payload) - offset}")
+
+    _need(2, "status code")
+    status_code = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+
+    _need(2, "header count")
+    header_count = struct.unpack("!H", payload[offset : offset + 2])[0]
+    offset += 2
+    headers: list[tuple[str, str]] = []
+    for i in range(header_count):
+        _need(2, f"header {i} key length")
+        kl = struct.unpack("!H", payload[offset : offset + 2])[0]
+        offset += 2
+        _need(kl, f"header {i} key")
+        key = payload[offset : offset + kl].decode("utf-8")
+        offset += kl
+        _need(2, f"header {i} value length")
+        vl = struct.unpack("!H", payload[offset : offset + 2])[0]
+        offset += 2
+        _need(vl, f"header {i} value")
+        val = payload[offset : offset + vl].decode("utf-8")
+        offset += vl
+        headers.append((key, val))
+
+    _need(4, "body length")
+    body_len = struct.unpack("!I", payload[offset : offset + 4])[0]
+    offset += 4
+    _need(body_len, "body")
+    body = payload[offset : offset + body_len]
+    return status_code, headers, body

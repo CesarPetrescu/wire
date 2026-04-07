@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -38,6 +38,18 @@ pub enum WireMessage {
 
 type PeerSender = mpsc::UnboundedSender<Vec<u8>>;
 
+/// A tunnel route entry registered by a peer.
+#[derive(Debug, Clone)]
+pub struct TunnelRoute {
+    pub prefix: String,
+    pub upstream: String,
+    pub peer_fp: String,
+    pub health_check: Option<String>,
+    pub healthy: bool,
+}
+
+type PendingRequests = Arc<RwLock<HashMap<[u8; 16], oneshot::Sender<Vec<u8>>>>>;
+
 pub struct Controller {
     host: String,
     port: u16,
@@ -48,6 +60,8 @@ pub struct Controller {
     pub message_rx: Option<mpsc::UnboundedReceiver<WireMessage>>,
     message_tx: mpsc::UnboundedSender<WireMessage>,
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    tunnel_routes: Arc<RwLock<HashMap<String, TunnelRoute>>>,
+    pending_requests: PendingRequests,
 }
 
 impl Controller {
@@ -63,7 +77,13 @@ impl Controller {
             message_rx: Some(message_rx),
             message_tx,
             shutdown_tx: None,
+            tunnel_routes: Arc::new(RwLock::new(HashMap::new())),
+            pending_requests: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub async fn tunnel_routes(&self) -> HashMap<String, TunnelRoute> {
+        self.tunnel_routes.read().await.clone()
     }
 
     pub fn fingerprint(&self) -> Option<&str> {
@@ -99,6 +119,8 @@ impl Controller {
         let pinned = self.pinned_peers.clone();
         let senders = self.peer_senders.clone();
         let msg_tx = self.message_tx.clone();
+        let tunnel_routes = self.tunnel_routes.clone();
+        let pending_requests = self.pending_requests.clone();
 
         tokio::spawn(async move {
             let mut shutdown_rx = shutdown_rx;
@@ -114,9 +136,12 @@ impl Controller {
                                 let pinned = pinned.clone();
                                 let senders = senders.clone();
                                 let msg_tx = msg_tx.clone();
+                                let tunnel_routes = tunnel_routes.clone();
+                                let pending_requests = pending_requests.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_connection(
                                         stream, acceptor, bundle, secret, pinned, senders, msg_tx,
+                                        tunnel_routes, pending_requests,
                                     ).await {
                                         error!("Connection error: {}", e);
                                     }
@@ -268,6 +293,8 @@ async fn handle_connection(
     pinned: Arc<RwLock<HashMap<String, bool>>>,
     senders: Arc<RwLock<HashMap<String, PeerSender>>>,
     msg_tx: mpsc::UnboundedSender<WireMessage>,
+    tunnel_routes: Arc<RwLock<HashMap<String, TunnelRoute>>>,
+    pending_requests: PendingRequests,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tls_stream = acceptor.accept(stream).await?;
     let ws_stream = tokio_tungstenite::accept_async(tls_stream).await?;
@@ -332,6 +359,39 @@ async fn handle_connection(
         false,
     )?;
     ws_tx.send(Message::Binary(ok_frame.into())).await?;
+
+    // Register tunnel routes if the peer advertised services
+    if let Some(services) = auth_data.get("services").and_then(|v| v.as_array()) {
+        let mut routes = tunnel_routes.write().await;
+        for svc in services {
+            if let (Some(prefix_raw), Some(upstream)) = (
+                svc.get("prefix").and_then(|v| v.as_str()),
+                svc.get("upstream").and_then(|v| v.as_str()),
+            ) {
+                let prefix = format!("/{}", prefix_raw.trim_matches('/'));
+                let health_check = svc
+                    .get("health_check")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                info!(
+                    "Tunnel route registered: {} -> peer {} (upstream {})",
+                    prefix,
+                    &peer_fp[..16],
+                    upstream,
+                );
+                routes.insert(
+                    prefix.clone(),
+                    TunnelRoute {
+                        prefix,
+                        upstream: upstream.to_string(),
+                        peer_fp: peer_fp.clone(),
+                        health_check,
+                        healthy: true,
+                    },
+                );
+            }
+        }
+    }
 
     // Set up send channel for this peer
     let (peer_tx, mut peer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -428,6 +488,15 @@ async fn handle_connection(
             continue;
         }
 
+        // HTTP_RESPONSE — resolve the pending tunnel request
+        if header.msg_type == MessageType::HttpResponse {
+            let mut pending = pending_requests.write().await;
+            if let Some(tx) = pending.remove(&header.msg_id) {
+                let _ = tx.send(payload);
+            }
+            continue;
+        }
+
         // Non-streamed relay
         if header.msg_type == MessageType::Relay {
             handle_relay(&peer_fp, &payload, &senders).await;
@@ -438,6 +507,20 @@ async fn handle_connection(
     }
 
     write_handle.abort();
+
+    // Remove tunnel routes owned by this peer
+    {
+        let mut routes = tunnel_routes.write().await;
+        let to_remove: Vec<String> = routes
+            .iter()
+            .filter(|(_, r)| r.peer_fp == peer_fp_clone)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for prefix in &to_remove {
+            routes.remove(prefix);
+            info!("Tunnel route removed: {}", prefix);
+        }
+    }
 
     // Notify remaining peers that this peer has left
     {

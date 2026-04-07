@@ -70,21 +70,21 @@ class TestRouteMatching:
     def test_match_exact_prefix(self):
         proxy = ReverseProxy()
         proxy.add_route("/api", "http://backend:3000")
-        upstream, remainder = proxy._match_route("/api")
+        upstream, remainder, _ = proxy._match_route("/api")
         assert upstream == "http://backend:3000"
         assert remainder == "/"
 
     def test_match_subpath(self):
         proxy = ReverseProxy()
         proxy.add_route("/api", "http://backend:3000")
-        upstream, remainder = proxy._match_route("/api/users/42")
+        upstream, remainder, _ = proxy._match_route("/api/users/42")
         assert upstream == "http://backend:3000"
         assert remainder == "/users/42"
 
     def test_no_match(self):
         proxy = ReverseProxy()
         proxy.add_route("/api", "http://backend:3000")
-        upstream, remainder = proxy._match_route("/dashboard")
+        upstream, remainder, _ = proxy._match_route("/dashboard")
         assert upstream is None
         assert remainder is None
 
@@ -92,14 +92,14 @@ class TestRouteMatching:
         proxy = ReverseProxy()
         proxy.add_route("/api", "http://general:3000")
         proxy.add_route("/api/v2", "http://v2-backend:3001")
-        upstream, remainder = proxy._match_route("/api/v2/items")
+        upstream, remainder, _ = proxy._match_route("/api/v2/items")
         assert upstream == "http://v2-backend:3001"
         assert remainder == "/items"
 
     def test_root_route_catches_all(self):
         proxy = ReverseProxy()
         proxy.add_route("/", "http://default:80")
-        upstream, remainder = proxy._match_route("/anything/here")
+        upstream, remainder, _ = proxy._match_route("/anything/here")
         assert upstream == "http://default:80"
         assert remainder == "/anything/here"
 
