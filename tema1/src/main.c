@@ -62,6 +62,18 @@ int main(int argc, char **argv) {
                         fclose(f);
                         return 1;
                 }
+                /*
+                 * The assignment guarantees N is a multiple of 40 and <= 1200.
+                 * opt_m relies on N % 8 == 0 for its unrolled kernels, so
+                 * refuse bad inputs early (local-testing safety net).
+                 */
+                if (N <= 0 || N % 40 != 0 || N > 1200) {
+                        fprintf(stderr,
+                                "Invalid N=%d (must be a positive multiple "
+                                "of 40, <= 1200)\n", N);
+                        fclose(f);
+                        return 1;
+                }
                 A = (double *)malloc(sizeof(double) * N * N);
                 B = (double *)malloc(sizeof(double) * N * N);
                 x = (double *)malloc(sizeof(double) * N);
@@ -88,7 +100,14 @@ int main(int argc, char **argv) {
                                       (t1.tv_nsec - t0.tv_nsec) / 1e9;
                         printf("Test N=%d Time=%.6lf\n", N, secs);
                 }
-                write_result(out_path, y, N);
+                if (write_result(out_path, y, N) != 0) {
+                        fprintf(stderr,
+                                "Could not write result for N=%d to '%s'\n",
+                                N, out_path);
+                        free(A); free(B); free(x); free(y);
+                        fclose(f);
+                        return 1;
+                }
 
                 free(A); free(B); free(x); free(y);
         }
