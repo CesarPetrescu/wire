@@ -1,0 +1,97 @@
+/*
+ * Tema 1 ASC - main driver (skeleton, overwritten at grading).
+ *
+ * Reads a test-description file, generates matrices A, B and vector x
+ * using the provided seed, calls my_solver, writes the result vector y
+ * to the output path and prints the elapsed time.
+ */
+
+#include "utils.h"
+
+static void generate_data(int N, unsigned int seed,
+                          double *A, double *B, double *x) {
+        int i, total = N * N;
+        srand(seed);
+        for (i = 0; i < total; i++)
+                A[i] = ((double)rand() / RAND_MAX) * 2.0 - 1.0;
+        for (i = 0; i < total; i++)
+                B[i] = ((double)rand() / RAND_MAX) * 2.0 - 1.0;
+        for (i = 0; i < N; i++)
+                x[i] = ((double)rand() / RAND_MAX) * 2.0 - 1.0;
+}
+
+static int write_result(const char *path, double *y, int N) {
+        FILE *f = fopen(path, "w");
+        int i;
+        if (!f) {
+                perror("fopen");
+                return -1;
+        }
+        for (i = 0; i < N; i++)
+                fprintf(f, "%.6lf\n", y[i]);
+        fclose(f);
+        return 0;
+}
+
+int main(int argc, char **argv) {
+        FILE *f;
+        int num_tests, t, N;
+        unsigned int seed;
+        char out_path[512];
+        double *A, *B, *x, *y;
+        struct timespec t0, t1;
+
+        if (argc != 2) {
+                fprintf(stderr, "Usage: %s <input_file>\n", argv[0]);
+                return 1;
+        }
+        f = fopen(argv[1], "r");
+        if (!f) {
+                perror("fopen input");
+                return 1;
+        }
+        if (fscanf(f, "%d", &num_tests) != 1) {
+                fprintf(stderr, "Cannot read number of tests\n");
+                fclose(f);
+                return 1;
+        }
+
+        for (t = 0; t < num_tests; t++) {
+                if (fscanf(f, "%d %u %511s", &N, &seed, out_path) != 3) {
+                        fprintf(stderr, "Bad test line %d\n", t);
+                        fclose(f);
+                        return 1;
+                }
+                A = (double *)malloc(sizeof(double) * N * N);
+                B = (double *)malloc(sizeof(double) * N * N);
+                x = (double *)malloc(sizeof(double) * N);
+                if (!A || !B || !x) {
+                        fprintf(stderr, "alloc failed for N=%d\n", N);
+                        free(A); free(B); free(x);
+                        fclose(f);
+                        return 1;
+                }
+                generate_data(N, seed, A, B, x);
+
+                clock_gettime(CLOCK_MONOTONIC, &t0);
+                y = my_solver(N, A, B, x);
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+
+                if (!y) {
+                        fprintf(stderr, "Solver failed for N=%d\n", N);
+                        free(A); free(B); free(x);
+                        fclose(f);
+                        return 1;
+                }
+                {
+                        double secs = (t1.tv_sec - t0.tv_sec) +
+                                      (t1.tv_nsec - t0.tv_nsec) / 1e9;
+                        printf("Test N=%d Time=%.6lf\n", N, secs);
+                }
+                write_result(out_path, y, N);
+
+                free(A); free(B); free(x); free(y);
+        }
+        fclose(f);
+        return 0;
+}

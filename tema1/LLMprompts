@@ -1,0 +1,135 @@
+LLM Prompts - Tema 1 ASC
+========================
+
+Unealta folosita : <ex: ChatGPT GPT-5 / Claude Sonnet 4.6 / Copilot>
+Versiune         : <ex: 2026-04>
+
+NOTA: Toate prompturile sunt ordonate cronologic. Dupa fiecare prompt
+urmeaza un scurt comentariu cu motivul formularii si ce am preluat /
+modificat manual din raspuns.
+
+
+================================================================
+1. Formulare initiala - BLAS
+================================================================
+
+Prompt:
+"Am de implementat in C urmatorul calcul folosind OpenBLAS (cblas.h):
+  C = A^T * B
+  D = C * C^T         (simetrica)
+  y = 0
+  for i in 0..N-1: y += D * row(C, i)
+  y += x
+A, B sunt NxN double, x,y sunt N. Ce apeluri BLAS minim necesare imi
+recomanzi ca sa ma apropii de performanta maxima? Vreau sa exploatez
+simetria lui D."
+
+Motiv: am cerut lista minima de apeluri BLAS ca sa nu pierd puncte
+folosind bucle de mana. Am preluat sugestiile dgemm/dsyrk/dgemv/daxpy
+si am ales dsyrk + oglindire (triunghi inferior) pentru ca dgemv cere
+D generala, nu packed triangular.
+
+
+================================================================
+2. Clarificare dsyrk
+================================================================
+
+Prompt:
+"Pentru cblas_dsyrk cu CblasRowMajor si CblasUpper, unde scrie exact
+rezultatul? Mai trebuie sa oglindesc manual triunghiul inferior daca
+vreau sa folosesc matricea D ulterior in cblas_dgemv?"
+
+Motiv: verificare layout; raspunsul a confirmat ca dsyrk scrie doar
+upper (sau lower), deci am adaugat bucla de oglindire dupa dsyrk.
+
+
+================================================================
+3. Neopt - ordinea buclelor pentru C = A^T * B
+================================================================
+
+Prompt:
+"Daca scriu de mana C[i][j] = sum_k A[k][i] * B[k][j] (A transpusa),
+care este ordinea de bucle cea mai simpla pentru versiunea neoptimizata?
+Ma intereseaza strict corectitudinea si ca D sa fie considerata simetrica
+in bucla urmatoare, fara alte optimizari."
+
+Motiv: pentru neopt trebuia sa evit sa introduc optimizari (altfel
+avantajul opt_m dispare). Am preferat i-j-k pentru C si i-j-k cu j>=i
+pentru D (exploatand simetria - cerinta obligatorie din enunt).
+
+
+================================================================
+4. Opt_m - blocking si reordonare
+================================================================
+
+Prompt:
+"Pentru versiunea optimizata, am pe un Haswell (AVX2, L1d=32KB).
+N este multiplu de 40 si <= 1200. Vreau sa pastrez complexitatea
+O(N^3) si sa nu folosesc intrinsics. Ce strategie imi recomanzi
+pentru inmultirea A^T * B ca sa minimizez miss-urile la L1 si sa las
+compilatorul sa auto-vectorizeze?"
+
+Raspuns sumarizat: reordonare k-i-j + register-broadcast pe A[k][i];
+unroll 8 pe j pentru ca B[k][j] si C[i][j] sa fie vectorizate cu
+AVX2 (4 doubles / ymm, dar 8x unroll da 2 load/store pe iteratie).
+
+Motivul alegerii: am vrut sa evit MKL-style blocking explicit; pe
+N<=1200 datele incape in L2, deci e de-ajuns reordonarea.
+
+
+================================================================
+5. Opt_m - D = C * C^T cu ILP
+================================================================
+
+Prompt:
+"Pentru D = C * C^T scris ca D[i][j] = <C[i,:], C[j,:]>, cum expun
+mai multi acumulatori ca sa pot profita de 2 unitati FMA ale Haswell?
+Vreau sa pastrez simetria (j >= i)."
+
+Raspuns sumarizat: 4 acumulatori s0..s3 cu unroll 8 pe k;
+reducere finala s0+s1+s2+s3. Am preluat varianta exact asa.
+
+
+================================================================
+6. Opt_m - bucla y cu broadcast pe 8 valori C
+================================================================
+
+Prompt:
+"In bucla y += D * row(C, i), daca incerc sa interschimb bucla exterioara
+cu cea interioara pe j astfel incat y[] sa fie actualizat cu 8 valori
+C[i][j..j+7] broadcast-uite simultan, pot folosi simetria lui D (D[p][j]
+= D[j][p]) ca sa accesez D row-major? Cum arata bucla?"
+
+Motiv: vroiam sa reduc store-urile in y[] de 8 ori. Am preluat schema
+(d0..d7 = D[j..j+7, :]) si am adaugat un unroll suplimentar k-4x pentru
+ca schedulerul sa poata suprapune FMA-urile.
+
+
+================================================================
+7. Cleanup manual
+================================================================
+
+Urmatoarele modificari au fost facute manual dupa ce am preluat
+codurile generate:
+
+  - am eliminat orice cod neutilizat (helperi, printf-uri de debug);
+  - am redus numarul de alocari (calloc in loc de malloc+memset);
+  - am aliniat stilul cu tabs si am marcat variabilele hot ca register;
+  - am verificat corectitudinea rezultatelor cu varianta BLAS (toleranta
+    1e-6) pentru N=400,800,1200 - toate OK;
+  - am rulat valgrind --tool=memcheck --leak-check=full pe toate cele
+    trei variante si am confirmat "no leaks are possible".
+
+
+================================================================
+8. Interpretare cachegrind (intrebare finala)
+================================================================
+
+Prompt:
+"Am rulat cachegrind cu --cache-sim=yes --branch-sim=yes pe neopt vs
+opt_m pentru N=400. Cum interpretez diferentele la D1 miss rate si
+Bc miss rate intre cele doua versiuni?"
+
+Motiv: pentru sectiunea din README "Observatii pe cache (I refs, D
+refs, Branches)". Am preluat explicatia la nivel general si am
+verificat empiric cifrele in fisierele *.cache.
