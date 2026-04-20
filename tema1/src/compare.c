@@ -36,6 +36,19 @@ int main(int argc, char **argv) {
                                 fclose(f1); fclose(f2);
                                 return 1;
                         }
+                        /*
+                         * Both fscanf returned the same non-1 value. EOF
+                         * means clean end-of-file (both files drained
+                         * normally). 0 means a non-numeric token was
+                         * encountered -- treat that as a corruption-type
+                         * diff instead of a silent "OK".
+                         */
+                        if (r1 == 0) {
+                                printf("DIFF non-numeric token at line %d "
+                                       "in both files\n", line + 1);
+                                fclose(f1); fclose(f2);
+                                return 1;
+                        }
                         break;
                 }
                 /*
