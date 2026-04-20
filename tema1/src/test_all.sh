@@ -28,7 +28,11 @@ mv out1 out1_opt;  mv out2 out2_opt;  mv out3 out3_opt
 
 echo ""
 echo "=== Correctness checks (blas vs neopt vs opt_m) ==="
+rc=0
 for i in 1 2 3; do
-    echo -n "N=$i blas vs neopt : "; ./compare out${i}_blas  out${i}_neopt 0.000001
-    echo -n "N=$i blas vs opt_m : "; ./compare out${i}_blas  out${i}_opt   0.000001
+    echo -n "N=$i blas vs neopt : "
+    ./compare out${i}_blas  out${i}_neopt 0.000001 || rc=1
+    echo -n "N=$i blas vs opt_m : "
+    ./compare out${i}_blas  out${i}_opt   0.000001 || rc=1
 done
+exit $rc

@@ -27,9 +27,17 @@ static int write_result(const char *path, double *y, int N) {
                 perror("fopen");
                 return -1;
         }
-        for (i = 0; i < N; i++)
-                fprintf(f, "%.6lf\n", y[i]);
-        fclose(f);
+        for (i = 0; i < N; i++) {
+                if (fprintf(f, "%.6lf\n", y[i]) < 0) {
+                        perror("fprintf");
+                        fclose(f);
+                        return -1;
+                }
+        }
+        if (fclose(f) != 0) {
+                perror("fclose");
+                return -1;
+        }
         return 0;
 }
 
