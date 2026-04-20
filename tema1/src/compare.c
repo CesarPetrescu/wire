@@ -38,6 +38,22 @@ int main(int argc, char **argv) {
                         }
                         break;
                 }
+                /*
+                 * NaN / non-finite handling: fabs(NaN - x) is NaN and
+                 * NaN > tol is always false, so a naive check would
+                 * accept NaN vs a finite value. Flag any line where
+                 * either value is non-finite (unless both match
+                 * exactly, i.e. +inf vs +inf).
+                 */
+                if (!isfinite(a) || !isfinite(b)) {
+                        if (!(a == b)) {
+                                diffs++;
+                                if (!isfinite(max_err) || max_err < 1.0)
+                                        max_err = INFINITY;
+                        }
+                        line++;
+                        continue;
+                }
                 double e = fabs(a - b);
                 if (e > max_err) max_err = e;
                 if (e > tol) diffs++;
