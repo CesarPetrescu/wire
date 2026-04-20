@@ -13,6 +13,11 @@
  * - 8-way j-broadcast in y-loop to minimize y[] store traffic
  * - D symmetry exploited (upper triangle computed, then mirrored)
  * - 4 independent accumulators in dot products to exploit ILP
+ *
+ * Precondition: N is a multiple of 40 (per assignment statement:
+ * "puteti presupune ca N este multiplu de 40 si ca este mai mic sau
+ * egal cu 1200"). That guarantees N % 8 == 0 and N % 4 == 0, so the
+ * unrolls below have no remainder to handle.
  */
 double* my_solver(int N, double *A, double *B, double *x) {
 	double *C, *D, *y;

@@ -23,7 +23,21 @@ int main(int argc, char **argv) {
                 perror("fopen");
                 return 2;
         }
-        while (fscanf(f1, "%lf", &a) == 1 && fscanf(f2, "%lf", &b) == 1) {
+        for (;;) {
+                int r1 = fscanf(f1, "%lf", &a);
+                int r2 = fscanf(f2, "%lf", &b);
+                if (r1 != 1 || r2 != 1) {
+                        if (r1 != r2) {
+                                printf("DIFF length mismatch at line %d "
+                                       "(file1 %s, file2 %s)\n",
+                                       line + 1,
+                                       r1 == 1 ? "continues" : "ends",
+                                       r2 == 1 ? "continues" : "ends");
+                                fclose(f1); fclose(f2);
+                                return 1;
+                        }
+                        break;
+                }
                 double e = fabs(a - b);
                 if (e > max_err) max_err = e;
                 if (e > tol) diffs++;
